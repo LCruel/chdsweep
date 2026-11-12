@@ -1,0 +1,7 @@
+# chdsweep from cron: copy to /etc/cron.d/chdsweep once a run by hand looks right.
+#
+# Weekly, Sunday 02:30, as root. -q: no output unless something is wrong, so cron only
+# mails on a problem. Settings come from /etc/chdsweep.conf; the run file goes to
+# /var/log/chdsweep. The exit code is the health of the run (0 full coverage, 1 partial,
+# 2 failed, 3 the previous run is still going), never whether cards were found.
+30 2 * * 0  root  /usr/bin/chdsweep scan -q

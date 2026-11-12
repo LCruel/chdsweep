@@ -1,0 +1,29 @@
+# chdsweep configuration for the periodic PAN discovery scan, written out.
+#
+# These are the built-in defaults: without a config file and without a path on the
+# command line, chdsweep scans exactly this. Copy the file and change it to scan
+# something else, then run:
+#
+#   sudo ./chdsweep scan -c pan-scan.conf -o run.jsonl
+#   sudo ./chdsweep report -o report run.jsonl
+
+# What to scan.
+path = /root
+path = /home
+path = /var/log
+
+# The system journal of the last 35 days, read as text from journalctl. 0: not scanned.
+journal_days = 35
+
+# What to ignore. An exclude that starts with a folder applies under that folder only;
+# a pattern without a folder (*.iso) applies everywhere.
+# Under /var/log: rotated and compressed logs (older than the period), and the binary
+# journal (its text is scanned through journal_days).
+exclude = /var/log/*.gz
+exclude = /var/log/*.xz
+exclude = /var/log/*.bz2
+exclude = /var/log/*.zst
+exclude = /var/log/*.zip
+exclude = /var/log/*.[0-9]
+exclude = /var/log/*-20[0-9][0-9][0-9][0-9][0-9][0-9]
+exclude = /var/log/journal

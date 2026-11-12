@@ -1,0 +1,21 @@
+# chdsweep triage file: hits a person has reviewed and accepted as false positives.
+# Copy to /etc/chdsweep/triage.csv on the machine where the report is made, or give it
+# with: chdsweep report --triage FILE
+#
+# It is applied in the report only; the run files stay as they are. A hit that matches
+# an entry moves from "open" or "likely false positive" to "accepted false positive".
+#
+# One entry per line:  host,path,masked,reason,who,date,ticket
+#   host     host name as in the run file, or * for every host
+#   path     the file's path, or a glob (* also matches /)
+#   masked   the masked number as the report shows it, or * for every number in the file
+#   reason   why it is not card data (put it in "quotes" when it has a comma)
+#   who      who decided
+#   date     when, YYYY-MM-DD; entries older than 12 months are listed for review again
+#   ticket   optional
+#
+# An entry that no longer matches any hit is listed in the report as stale.
+host,path,masked,reason,who,date,ticket
+web01,/srv/shop/docs/supplier-sample.txt,*,"Sample number from the supplier, never issued",J. Jansen,2026-11-12,CHG-1042
+*,/opt/app/lib/*/testdata/*,*,Test data shipped with the application,J. Jansen,2026-11-12,
+db01,/var/backups/import.csv,453201******1234,Order number that passes Luhn; checked with finance,J. Jansen,2026-11-12,CHG-1050

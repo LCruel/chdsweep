@@ -1,0 +1,22 @@
+# chdsweep false-positive rules: copy to /etc/chdsweep/fp-rules.conf
+# A rule marks a hit with a reason; it never drops one. A hit no rule marks is an open hit.
+# Switching a rule off makes its hits open again. Values shown are the defaults.
+
+test-card      = on    # published test card numbers
+repeat-digits  = on    # at most two distinct digits after the first six
+sequence       = on    # ascending or descending run of digits
+low-luhn-ratio = on    # the file's Luhn pass rate is what random numbers give
+id-keyword     = on    # labelled as an ID just before the number, on the same line
+inside-token   = on    # part of a longer identifier joined by . / : = or -
+package-file   = on    # unchanged file of an installed package (dpkg; needs libcrypto)
+test-path      = on    # test or library folder, only together with another rule
+binary-context = on    # digits between non-printable bytes, outside known database formats
+
+low-luhn-ratio.percent  = 30   # mark when fewer than this share of candidates pass Luhn
+low-luhn-ratio.min-runs = 20   # ... and the file has at least this many candidates
+id-keyword.window       = 32   # bytes before the number that are looked at (1 to 64)
+
+# Extra key names on top of the built-in list (comma separated). Example:
+#id-keyword.add = customer_no, parcel
+# Or replace the built-in list:
+#id-keyword.keywords = imei, iccid, serial, order_id, invoice, tracking, uuid, timestamp, phone, iban

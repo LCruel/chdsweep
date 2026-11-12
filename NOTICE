@@ -1,0 +1,28 @@
+chdsweep
+Copyright (c) 2026 D.J.S. van den Akker
+Licensed under the MIT License (see LICENSE). The only condition is credit:
+keep the copyright notice and the licence text with every copy.
+
+Inspiration
+-----------
+chdsweep was inspired by two earlier card number scanners.
+
+- ccsrch, by Mike Beekey and Adam Caudill (GPL-2.0).
+  https://github.com/adamcaudill/ccsrch
+- PANhunt, by Dionach (BSD-3-Clause), and its fork by zbalkan.
+  https://github.com/Dionach/PANhunt
+
+Data
+----
+The BIN table in data/bin-table.csv.gz is derived from bin-list-data by
+Venelin Kochev / BinLookup.io, under CC BY 4.0
+(https://creativecommons.org/licenses/by/4.0/). It was changed: trimmed to
+the six fields chdsweep uses (tools/bin-trim.py). The first line of the file
+gives the upstream commit and the date it was pulled. It is not an official
+BIN register. It is compiled into the binary; every report names this source.
+https://github.com/venelinkochev/bin-list-data
+
+Libraries loaded at run time, not included
+------------------------------------------
+- libarchive (BSD-2-Clause)
+- OpenSSL libcrypto (Apache-2.0; OpenSSL 1.1: OpenSSL and SSLeay licences)

@@ -1,0 +1,51 @@
+# chdsweep configuration: copy to /etc/chdsweep.conf
+# "key = value" lines. Every value shown is the default, unless marked as an example.
+
+# What to search. Repeat "path" for more than one. Without any path: /root, /home, the
+# current logs in /var/log and the journal of the last 35 days (see pan-scan.conf.example).
+#path = /
+# System journal of the last N days, read from journalctl. Default: 35 without a path, else 0.
+#journal_days = 35
+# Excluded: a folder (with everything below it) or a glob. A glob without a folder
+# applies everywhere; start it with a folder to exclude under that folder only. Examples:
+#exclude = /var/lib/docker
+#exclude = *.iso
+#exclude = /var/log/*.gz
+
+# Run file: one JSON Lines file per run, <output_dir>/chdsweep-<host>-<time>.jsonl
+output_dir = /var/log/chdsweep
+# Lock against overlapping runs. Empty: no lock.
+lock_file = /run/chdsweep.lock
+
+# Disk load. A scan reads every file in its scope, so it competes with the server's own
+# disk use and pushes other data out of the file cache. One worker keeps that modest;
+# more workers finish sooner and load the disk more. ionice_idle only has an effect with
+# the bfq I/O scheduler; with none or mq-deadline (most servers) it does nothing, so on a
+# busy server set max_read_rate, which works everywhere.
+threads = 1
+max_read_rate = 0           # read from disk per second, all workers together, e.g. 20M; 0: no limit
+nice = 10
+ionice_idle = yes
+quiet = no                  # yes for cron: no summary at the end
+progress = no               # yes: on a terminal, one line per worker with its folder
+
+# Masking: auto keeps the first eight digits for numbers of 16 digits or more and
+# the first six for shorter ones; 6 keeps six for every length. The last four are always kept.
+keep_leading = auto
+
+# False-positive rules. Default: /etc/chdsweep/fp-rules.conf if it exists, else built in.
+#rules_file = /etc/chdsweep/fp-rules.conf
+
+# Limits. A file that hits one is listed in the run file as not (fully) scanned.
+max_file_size = 2G          # 0: no limit
+max_depth = 3               # archives inside archives
+max_unpacked = 1G           # unpacked bytes per file
+max_ratio = 200             # unpacked size / file size (zip bombs)
+max_members = 100000        # members per archive
+max_file_seconds = 300      # 0: no limit
+# Numbers listed per file. A file with more is read to the end and the rest are counted,
+# so one file full of numbers cannot use up the memory or fill the disk with its run file.
+max_hits_per_file = 10000   # 0: no limit
+
+# yes: a missing optional library is a failure (exit 2) instead of partial coverage.
+require_all_libraries = no
