@@ -8,7 +8,7 @@
 #include <sys/types.h>
 #include <time.h>
 
-#define CHD_VERSION "0.1.0-dev"
+#define CHD_VERSION "0.1.0"
 
 /* Exit codes: health of the run, never whether cards were found. */
 enum { EXIT_FULL = 0, EXIT_PARTIAL = 1, EXIT_FAILED = 2, EXIT_LOCKED = 3 };
