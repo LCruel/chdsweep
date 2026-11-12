@@ -13,6 +13,8 @@ src=$(pwd)
 [ -f "$src/Makefile" ] || { echo "run from the repository root" >&2; exit 2; }
 mkdir -p dist
 version=$(sed -n 's/^.define CHD_VERSION "\(.*\)"/\1/p' src/chdsweep.h)
+# The files of this version only: dist/ may still hold those of an earlier one.
+deb="chdsweep_$(echo "$version" | tr - "~")_amd64.deb"
 
 echo "=== .deb on ubuntu:20.04"
 docker run --rm -v "$src:/src:ro" -v "$src/dist:/out" ubuntu:20.04 sh -c '
@@ -40,9 +42,9 @@ for arch in x86_64 arm64; do
 done
 
 echo "=== try the .deb on ubuntu:24.04 (libraries not installed, then installed)"
-docker run --rm -v "$src/dist:/dist:ro" ubuntu:24.04 sh -c '
+docker run --rm -v "$src/dist:/dist:ro" -e DEB="$deb" ubuntu:24.04 sh -c '
     set -e
-    dpkg -i /dist/chdsweep_*.deb >/dev/null
+    dpkg -i "/dist/$DEB" >/dev/null
     chdsweep version | head -1
     chdsweep check | grep -E "found|MISSING" || true
     (apt-get update && apt-get install -y --no-install-recommends libarchive13t64) >/dev/null 2>&1
@@ -51,9 +53,8 @@ docker run --rm -v "$src/dist:/dist:ro" ubuntu:24.04 sh -c '
     chdsweep report -o /tmp/report /tmp/run.jsonl'
 
 echo "=== try the static binary on busybox (nothing installed)"
-docker run --rm -v "$src/dist:/dist:ro" busybox sh -c '
+docker run --rm -v "$src/dist:/dist:ro" -e B="/dist/chdsweep-$version-static-x86_64" busybox sh -c '
     set -e
-    B=$(ls /dist/chdsweep-*-static-x86_64)
     $B version | head -1
     $B check | grep -E "found|MISSING"
     mkdir -p /data && echo "card 4539148803436467 here" > /data/a.txt
