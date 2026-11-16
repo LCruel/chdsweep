@@ -85,15 +85,25 @@ build_static() {   # $1: x86_64 or arm64
 static_x86_64() { build_static x86_64; }
 static_arm64() { build_static arm64; }
 
-# The .deb without its recommended packages, then with libarchive: what check says each time.
+# An optional library that is missing must not stop chdsweep: installed without its
+# recommended packages it starts and names libarchive as missing, with the effect and the
+# fix; once libarchive is installed it is found, without installing chdsweep again.
 deb_bare() {
     docker run --rm -v "$src/dist:/dist:ro" -e DEB="$deb" ubuntu:24.04 sh -c '
         set -e
         dpkg -i "/dist/$DEB" >/dev/null
         chdsweep version | head -1
-        chdsweep check | grep -E "found|MISSING" || true
+        echo "--- installed without the recommended packages: what check says"
+        chdsweep check > /tmp/check1 || true
+        grep -E "found|MISSING" /tmp/check1
+        grep -q "libarchive  MISSING" /tmp/check1
+        grep -q "Effect: archives" /tmp/check1 && grep -q "Fix:    apt install libarchive13" /tmp/check1
+        echo "--- after apt install libarchive13t64: what check says"
         (apt-get update && apt-get install -y --no-install-recommends libarchive13t64) >/dev/null 2>&1
-        chdsweep check | grep -E "found|MISSING"
+        chdsweep check > /tmp/check2 || true
+        grep -E "found|MISSING" /tmp/check2
+        grep -q "libarchive  found" /tmp/check2
+        echo "--- a scan and a report with it"
         chdsweep scan -q --no-lock -o /tmp/run.jsonl /etc && echo "scan of /etc: full coverage"
         chdsweep report -o /tmp/report /tmp/run.jsonl'
 }
@@ -136,7 +146,7 @@ step "Build the amd64 .deb on Ubuntu 20.04 and run the test suite" deb_amd64
 step "Build the arm64 .deb on Ubuntu 20.04" deb_arm64
 step "Build the static binary for x86_64 on Alpine 3.20" static_x86_64
 step "Build the static binary for arm64 on Alpine 3.20" static_arm64
-step "The .deb on Ubuntu 24.04 without, then with libarchive" deb_bare
+step "The .deb on Ubuntu 24.04 with libarchive missing, then installed: check names it both times" deb_bare
 step "Install, scan, remove and purge the .deb on Debian 12" try_debian
 step "Install, scan, remove and purge the .deb on Ubuntu 24.04" try_ubuntu
 step "Self test and formats trial with the installed .deb on Ubuntu 24.04" deb_full
