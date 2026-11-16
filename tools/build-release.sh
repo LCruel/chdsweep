@@ -146,7 +146,8 @@ step "Formats trial with the static binary on Alpine 3.20" static_formats
 files="chdsweep_${debver}_amd64.deb chdsweep_${debver}_arm64.deb chdsweep-$version-static-x86_64 chdsweep-$version-static-arm64"
 (cd dist && sha256sum $files > SHA256SUMS 2>"$logs/sums.err") || { nfail=$((nfail + 1)); cat "$logs/sums.err"; }
 
-commit=$(git rev-parse --short HEAD 2>/dev/null || echo unknown)
+# When git cannot say, its own message goes into the report instead of the commit.
+commit=$(git rev-parse --short HEAD 2>&1) || commit="unknown ($(echo "$commit" | head -n 1))"
 git status --porcelain 2>/dev/null | grep -q . && commit="$commit, with changes that are not committed"
 {
     echo "# chdsweep $version: test report"
