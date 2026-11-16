@@ -6,7 +6,10 @@ checks the run file of the real binary against what each file must give.
 
 Every number here is made up. Needs only the Python standard library. The archive
 tests run when `chdsweep check` finds libarchive, and are reported as skipped when not.
+The PDF tests run twice: always against a stand-in for pdftotext, and against the real
+pdftotext (poppler-utils) when it is installed, reported as skipped when not.
 """
+import base64
 import fcntl
 import gzip
 import hashlib
@@ -15,12 +18,14 @@ import json
 import os
 import random
 import shutil
+import struct
 import subprocess
 import sys
 import tarfile
 import tempfile
 import time
 import zipfile
+import zlib
 
 BIN = os.path.abspath(sys.argv[1] if len(sys.argv) > 1 else "build/chdsweep")
 rnd = random.Random(2026)
@@ -229,6 +234,29 @@ def test_package_file(tmp):
     check(any(m["reason"] == "Unchanged file from package libfoo" for m in d[0]["marks"]), "package reason")
     c = hits_in(r, root, "usr/share/doc/libfoo/changed.txt")
     check(len(c) == 1 and c[0]["marks"] == [], "a changed package file stays open")
+    check("package-file rule is off" not in (r["header"]["messages"] or ""), "no notice when the rule works")
+
+    # The rule cannot work: the scan is the same, the hits stay open, and a notice says why.
+    cases = [({"CHDSWEEP_DPKG_INFO": info, "CHDSWEEP_NO_MD5": "1"}, "does not allow MD5"),
+             ({"CHDSWEEP_DPKG_INFO": os.path.join(tmp, "no-dpkg")}, "no dpkg package database")]
+    for env, text in cases:
+        r2 = run(root, env=env, expect=0)
+        d = hits_in(r2, root, "usr/share/doc/libfoo/example.txt")
+        check(len(d) == 2 and not any("package-file" in marks(h) for h in d), "rule off: hits stay open (%s)" % text)
+        m = r2["header"]["messages"] or ""
+        check("package-file rule is off" in m and text in m and "Effect:" in m and "Nothing is left unscanned" in m,
+              "rule off: the run file says why (%s)" % text)
+        check(text not in r2["stderr"], "rule off: nothing on the terminal in quiet mode")
+        e = dict(os.environ)
+        e.update(env)
+        p = subprocess.run([BIN, "scan", "--no-lock", "-o", os.path.join(tmp, "loud.jsonl"), root],
+                           env=e, capture_output=True, text=True)
+        check(text in p.stderr, "rule off: said on the terminal when not quiet (%s)" % text)
+        p = subprocess.run([BIN, "check"], env=e, capture_output=True, text=True)
+        check(text in p.stdout, "rule off: check says why (%s)" % text)
+    rules = write(tmp, "nopkg.conf", "package-file = off\n")
+    r3 = run(root, "-s", "rules_file=" + rules, env=cases[1][0], expect=0)
+    check("package-file" not in (r3["header"]["messages"] or ""), "no notice when the rule is switched off")
 
 
 def test_boundary(tmp):
@@ -258,9 +286,28 @@ def test_journal(tmp):
           "journalctl is asked for the last 35 days")
     r = run(root, expect=0)
     check(r["hits"] == [] and r["header"]["journal_days"] == 0, "with a path given the journal is not read unless asked")
-    write(tmp, "fakebin/journalctl", "#!/bin/sh\nexit 1\n")
+    write(tmp, "fakebin/journalctl", "#!/bin/sh\necho 'No journal files were opened' >&2\nexit 1\n")
     r = run(root, "-s", "journal_days=7", env=env, expect=1)
-    check(any(s["path"] == "journal (last 7 days)" for s in r["skips"]), "a failing journalctl is listed as not scanned")
+    check([(s["path"], s["reason"]) for s in r["skips"]]
+          == [("journal (last 7 days)", "not scanned: journalctl failed (No journal files were opened)")],
+          "a failing journalctl is listed with its own error: %s" % r["skips"])
+    write(tmp, "fakebin/journalctl", "#!/bin/sh\nexit 3\n")
+    r = run(root, "-s", "journal_days=7", env=env, expect=1)
+    check(r["skips"][0]["reason"] == "not scanned: journalctl failed (exit status 3)", "or with its exit status")
+    write(tmp, "fakebin/journalctl", "#!/bin/sh\necho \"$0\" > %s/started\n" % tmp)
+    run(root, "-s", "journal_days=7", env=dict(env, SHELL="/nonexistent"), expect=0)
+    check(open(os.path.join(tmp, "started")).read().strip() == fake, "journalctl is started by its full path")
+
+    # A host without journalctl has no journal: no gap in the coverage, and the run file says so.
+    none = {"CHDSWEEP_NO_JOURNALCTL": "1"}
+    r = run(root, "-s", "journal_days=7", env=none, expect=0)
+    m = r["header"]["messages"] or ""
+    check(r["skips"] == [] and r["header"]["journal_days"] == 0, "no journalctl: not a skipped file")
+    check("journalctl was not found" in m and "journal_days = 0" in m, "no journalctl: the run file says so, with the fix")
+    p = subprocess.run([BIN, "check"], env=dict(os.environ, **none), capture_output=True, text=True)
+    check("journalctl  not found" in p.stdout and "no systemd journal" in p.stdout, "check: no journalctl")
+    p = subprocess.run([BIN, "check"], env=dict(os.environ, **env), capture_output=True, text=True)
+    check("journalctl  found     " + fake in p.stdout, "check: journalctl with its path")
 
 
 def test_health(tmp):
@@ -289,6 +336,20 @@ def test_health(tmp):
     check(p.returncode == 2, "output not writable: exit 2")
     p = scan("--no-lock", "-o", out, os.path.join(tmp, "no-such-path"))
     check(p.returncode == 1, "path not found: partial")
+
+    # The example files that come with chdsweep must load as they are: the .deb places one as
+    # /etc/chdsweep.conf. They have comments after values.
+    etc = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "etc")
+    for conf in ("chdsweep.conf.example", "pan-scan.conf.example"):
+        p = scan("-c", os.path.join(etc, conf), "--no-lock", "-o", out, "-s", "journal_days=0",
+                 "-s", "rules_file=" + os.path.join(etc, "fp-rules.conf.example"), root)
+        check(p.returncode in (0, 1) and "config" not in p.stderr and "rules file" not in p.stderr,
+              "%s and fp-rules.conf.example load as shipped (%d %s)" % (conf, p.returncode, p.stderr))
+    conf = write(tmp, "comments.conf", "threads = 2   # two\nexclude = /tmp/a#b\n#path = /x\n  # indented\n")
+    p = scan("-c", conf, "--no-lock", "-o", out, root)
+    head = json.loads(open(out).readline())
+    check(head["threads"] == 2 and head["excludes"] == ["/tmp/a#b"],
+          "a comment after a value is cut; a # inside a value is kept: %s" % head["excludes"])
 
     good = write(tmp, "good.conf", "# test\npath = %s\nthreads = 2\nmax_depth = 1\nkeep_leading = 6\n"
                                    "lock_file = %s\noutput_file = %s\nquiet = yes\n"
@@ -410,7 +471,9 @@ def test_missing_libraries(tmp):
     r = run(root, env=env, expect=1)
     check("libarchive not found" in r["stderr"] and "Effect:" in r["stderr"] and "Fix:" in r["stderr"],
           "message names the library, the effect and the fix, also in quiet mode")
-    check("libcrypto" not in r["stderr"], "no libcrypto message during a scan")
+    check("libcrypto" not in r["stderr"], "no libcrypto message on the terminal in quiet mode")
+    root_note = "not running as root" in (r["header"]["messages"] or "")
+    check(root_note == (os.geteuid() != 0), "the run file says when the scan did not run as root")
     check(len(r["hits"]) == 1, "plain files are still scanned")
     check(len(r["skips"]) == 7 and all(s["reason"] == "not scanned: libarchive not available" for s in r["skips"]),
           "every archive is listed as not scanned")
@@ -427,6 +490,279 @@ def test_missing_libraries(tmp):
     check(p.returncode == 1 and "MISSING" in p.stdout, "check: exit 1 when a library is missing")
 
 
+# A stand-in for pdftotext, so that what chdsweep does with each answer of pdftotext can be
+# tested on any machine. A test PDF says in its second line what the stand-in must do.
+FAKE_PDFTOTEXT = r"""#!/usr/bin/env python3
+import base64, os, signal, sys, time
+a = sys.argv[1:]
+if "-v" in a:
+    sys.stderr.write("pdftotext version 9.99.0\nCopyright 2005-2026 The Poppler Developers\n")
+    sys.exit(0)
+last = int(a[a.index("-l") + 1]) if "-l" in a else 0
+lines = open(a[-2], "rb").read().split(b"\n")
+mode = lines[1].decode().split()[1]
+if mode == "password":
+    sys.stderr.write("Command Line Error: Incorrect password\n")
+    sys.exit(1)
+if mode == "nocopy":
+    sys.stderr.write("Permission Error: Copying of text from this document is not allowed.\n")
+    sys.exit(3)
+if mode == "broken":
+    sys.stderr.write("Syntax Error: Couldn't find trailer dictionary\n" * 2000)
+    sys.exit(1)
+if mode == "segv":
+    os.kill(os.getpid(), signal.SIGSEGV)
+pages = base64.b64decode(lines[2]).split(b"\f")[:-1]
+if last:
+    pages = pages[:last]
+out = sys.stdout.buffer
+for page in pages:
+    out.write(page + b"\f")
+    out.flush()
+    if mode == "hang":
+        time.sleep(300)
+"""
+
+
+def fake_pdf(mode, *pages):
+    """A file that starts like a PDF, for the stand-in. The page texts are base64, so the
+    bytes of the file do not show the numbers."""
+    text = "".join(page + "\f" for page in pages).encode()
+    return b"%PDF-1.4\n%FAKE " + mode.encode() + b"\n" + base64.b64encode(text) + b"\n%%EOF\n"
+
+
+def skips_in(result, root, rel):
+    path = os.path.realpath(os.path.join(root, rel))
+    return [s for s in result["skips"] if s["path"] == path]
+
+
+def test_pdf_stand_in(tmp):
+    """PDF text with a stand-in for pdftotext: hand-off, pages, limits, and every way it can fail."""
+    root = os.path.join(tmp, "pdf")
+    fake = write(tmp, "pdfbin/pdftotext", FAKE_PDFTOTEXT)
+    os.chmod(fake, 0o755)
+    env = {"PATH": os.path.join(tmp, "pdfbin") + ":" + os.environ["PATH"]}
+    a, b, c, d, e = card("4539"), card("5412"), card("6011"), card("4024"), card("3714", 15)
+
+    write(root, "ok/report.pdf", fake_pdf("text", "first page\n", "paid with " + a + "\n"))
+    write(root, "ok/wrong-name.dat", fake_pdf("text", "card " + grouped(b) + "\n"))
+    write(root, "ok/not-a.pdf", "plain text with the name of a PDF, " + c + "\n")
+    r = run(root, env=env, expect=0)
+    h = hits_in(r, root, "ok/report.pdf")
+    check(len(h) == 1 and h[0].get("member") == "(PDF text)" and h[0].get("page") == 2 and h[0]["marks"] == [],
+          "PDF text: number found, with its page: %s" % h)
+    h = hits_in(r, root, "ok/wrong-name.dat")
+    check(len(h) == 1 and h[0].get("page") == 1, "a PDF is known by its content, not its name")
+    h = hits_in(r, root, "ok/not-a.pdf")
+    check(len(h) == 1 and "member" not in h[0], "a .pdf that is not a PDF is scanned as a plain file")
+    check(r["skips"] == [] and r["end"]["counters"]["pdf_text_read"] == 2, "PDFs read in full are not listed as skipped")
+    lib, lim = r["header"]["libraries"], r["header"]["limits"]
+    check(lib["pdftotext"] == "9.99.0 (poppler)" and r["header"]["pdf_text"] is True, "header records pdftotext")
+    check(lim["max_pdf_pages"] == 2000 and lim["max_pdf_size"] == 100 << 20, "default PDF limits: 2000 pages, 100M")
+    e2 = dict(os.environ)
+    e2.update(env)
+    p = subprocess.run([BIN, "check"], env=e2, capture_output=True, text=True)
+    check("pdftotext   found" in p.stdout, "check lists pdftotext")
+
+    # pages without text, and the page limit
+    shutil.rmtree(os.path.join(root, "ok"))
+    write(root, "pages/mixed.pdf", fake_pdf("text", "one " + a + "\n", " \n", "", "four " + b + "\n"))
+    write(root, "pages/scan.pdf", fake_pdf("text", "", "\n"))
+    write(root, "pages/long.pdf", fake_pdf("text", "1 " + c + "\n", "2\n", "3 " + d + "\n", "4\n", "5\n"))
+    write(root, "pages/exact.pdf", fake_pdf("text", "1\n", "2 " + e + "\n"))
+    r = run(root, "-s", "max_pdf_pages=2", "-j", "3", env=env, expect=1)
+    s = skips_in(r, root, "pages/mixed.pdf")
+    check(len(s) == 2 and {x["reason"].split(",")[1].strip() for x in s}
+          == {"more pages than max_pdf_pages", "some pages have no text (images only"}
+          and all(x["pages_read"] == 2 and x["pages_without_text"] == 1 for x in s), "pages without text are counted: %s" % s)
+    s = skips_in(r, root, "pages/scan.pdf")
+    check(len(s) == 1 and s[0]["reason"].startswith("not fully scanned: PDF has no text") and s[0]["pages_read"] == 2,
+          "a PDF without any text is listed: %s" % s)
+    s = skips_in(r, root, "pages/long.pdf")
+    check(len(s) == 1 and "max_pdf_pages" in s[0]["reason"] and s[0]["pages_read"] == 2, "page limit is listed: %s" % s)
+    check([x["page"] for x in hits_in(r, root, "pages/long.pdf")] == [1], "only the pages within the limit are read")
+    check(skips_in(r, root, "pages/exact.pdf") == [] and len(hits_in(r, root, "pages/exact.pdf")) == 1,
+          "a PDF of exactly the page limit is read in full")
+    r = run(root, "-s", "max_pdf_pages=0", env=env, expect=1)
+    check([x["page"] for x in hits_in(r, root, "pages/long.pdf")] == [1, 3] and not skips_in(r, root, "pages/long.pdf"),
+          "max_pdf_pages=0: no page limit")
+
+    # every way pdftotext can fail is listed with its own reason, and the run goes on
+    shutil.rmtree(os.path.join(root, "pages"))
+    for mode in ("password", "nocopy", "broken", "segv"):
+        write(root, "bad/%s.pdf" % mode, fake_pdf(mode, "x"))
+    write(root, "bad/after.txt", a + "\n")
+    r = run(root, env=env, expect=1)
+    why = {os.path.basename(x["path"]): x["reason"] for x in r["skips"]}
+    start = "not fully scanned: PDF text not read, "
+    check(why.get("password.pdf") == start + "password protected", "password protected PDF: %s" % why)
+    check(why.get("nocopy.pdf") == start + "the document does not allow its text to be copied", "copy-protected PDF")
+    check(why.get("broken.pdf") == start + "pdftotext could not read the file (exit 1)", "broken PDF")
+    check(why.get("segv.pdf") == start + "pdftotext was stopped by signal 11", "a crash of pdftotext costs one file")
+    check(len(r["skips"]) == 4 and len(hits_in(r, root, "bad/after.txt")) == 1, "the scan goes on after each failure")
+
+    # a pdftotext that never finishes is stopped at the time limit
+    shutil.rmtree(os.path.join(root, "bad"))
+    write(root, "slow/hang.pdf", fake_pdf("hang", "page one " + a + "\n", "never\n"))
+    t0 = time.monotonic()
+    r = run(root, "-s", "max_file_seconds=2", env=env, expect=1)
+    took = time.monotonic() - t0
+    check([x["reason"] for x in r["skips"]] == ["not fully scanned: time limit max_file_seconds reached"] and took < 30,
+          "time limit stops pdftotext (%.1f s): %s" % (took, r["skips"]))
+    check(len(r["hits"]) == 1, "what came before the time limit is kept")
+
+    # size limit, switched off, not installed: the bytes are still scanned
+    shutil.rmtree(os.path.join(root, "slow"))
+    plain = b"%PDF-1.4\n%FAKE text\n" + base64.b64encode(b"x\f") + b"\n(stored as it is: " + a.encode() + b")\n"
+    write(root, "off/plain.pdf", plain + b"%" + b"x" * 3000 + b"\n")
+    r = run(root, "-s", "max_pdf_size=1K", env=env, expect=1)
+    check([x["reason"] for x in r["skips"]] == [start + "larger than max_pdf_size"], "PDF over max_pdf_size is listed")
+    check(len(r["hits"]) == 1 and "member" not in r["hits"][0], "its bytes are still scanned")
+    r = run(root, "-s", "pdf_text=no", env=env, expect=1)
+    check([x["reason"] for x in r["skips"]] == [start + "pdf_text is off"] and len(r["hits"]) == 1
+          and r["header"]["pdf_text"] is False, "pdf_text=no: listed, bytes scanned")
+    none = {"CHDSWEEP_NO_OPTIONAL_LIBS": "1"}
+    r = run(root, env=none, expect=1)
+    check([x["reason"] for x in r["skips"]] == [start + "pdftotext not available"] and len(r["hits"]) == 1
+          and r["header"]["libraries"]["pdftotext"] is None, "without pdftotext: listed, bytes scanned")
+    check("pdftotext" not in r["stderr"], "a missing pdftotext is not announced on every run")
+    p = subprocess.run([BIN, "check"], env=dict(os.environ, **none), capture_output=True, text=True)
+    check("pdftotext   MISSING" in p.stdout and "poppler-utils" in p.stdout, "check: missing pdftotext with the fix")
+
+    # a PDF inside an archive is copied to memory and handed over from there
+    if have_libarchive():
+        shutil.rmtree(os.path.join(root, "off"))
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+            z.writestr("docs/invoice.pdf", fake_pdf("text", "total\n", "card " + b + "\n"))
+            z.writestr("docs/big.pdf", fake_pdf("text", "card " + c + "\n") + b"%" + b"x" * 5000)
+            z.writestr("readme.txt", "nothing")
+        write(root, "zip/mail.zip", buf.getvalue())
+        r = run(root, env=env, expect=0)
+        got = sorted((x.get("member"), x.get("page")) for x in r["hits"])
+        check(got == [("docs/big.pdf!(PDF text)", 1), ("docs/invoice.pdf!(PDF text)", 2)], "PDF inside a zip: %s" % got)
+        r = run(root, "-s", "max_pdf_size=2K", env=env, expect=1)
+        check([(x.get("member"), x["reason"]) for x in r["skips"]] == [("docs/big.pdf", start + "larger than max_pdf_size")]
+              and len(r["hits"]) == 1, "PDF inside a zip over max_pdf_size: %s" % r["skips"])
+
+
+def rc4(key, data):
+    s, j, out = list(range(256)), 0, bytearray()
+    for i in range(256):
+        j = (j + s[i] + key[i % len(key)]) & 255
+        s[i], s[j] = s[j], s[i]
+    i = j = 0
+    for byte in data:
+        i = (i + 1) & 255
+        j = (j + s[i]) & 255
+        s[i], s[j] = s[j], s[i]
+        out.append(byte ^ s[(s[i] + s[j]) & 255])
+    return bytes(out)
+
+
+def real_pdf(pages, password=None, permissions=-4):
+    """A real PDF, written by hand. pages: the content stream of each page, or None for a
+    page without content (a scanned page shows a picture and no text). The streams are
+    compressed, as in nearly every PDF, so the bytes of the file do not show the text.
+    password: the password to open it (RC4, 40 bit); "" encrypts without asking for one."""
+    objs = {1: b"<< /Type /Catalog /Pages 2 0 R >>",
+            3: b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"}
+    streams, kids, num = {}, [], 4
+    for content in pages:
+        page = b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 3 0 R >> >>"
+        if content is not None:
+            streams[num] = zlib.compress(content.encode())
+            page += b" /Contents %d 0 R" % num
+            num += 1
+        objs[num] = page + b" >>"
+        kids.append(num)
+        num += 1
+    objs[2] = b"<< /Type /Pages /Count %d /Kids [%s] >>" % (len(kids), b" ".join(b"%d 0 R" % k for k in kids))
+    file_id = hashlib.md5(repr(pages).encode()).digest()
+    trailer = b"/Root 1 0 R /ID [<%s> <%s>]" % (file_id.hex().encode(), file_id.hex().encode())
+    if password is not None:
+        pad = bytes.fromhex("28BF4E5E4E758A4164004E56FFFA01082E2E00B6D0683E802F0CA9FE6453697A")
+        user = (password.encode() + pad)[:32]
+        o = rc4(hashlib.md5((b"owner" + pad)[:32]).digest()[:5], user)
+        key = hashlib.md5(user + o + struct.pack("<i", permissions) + file_id).digest()[:5]
+        for n in streams:
+            streams[n] = rc4(hashlib.md5(key + struct.pack("<I", n)[:3] + b"\0\0").digest()[:10], streams[n])
+        objs[num] = b"<< /Filter /Standard /V 1 /R 2 /O <%s> /U <%s> /P %d >>" % (
+            o.hex().encode(), rc4(key, pad).hex().encode(), permissions)
+        trailer += b" /Encrypt %d 0 R" % num
+    for n, data in streams.items():
+        objs[n] = b"<< /Length %d /Filter /FlateDecode >>\nstream\n" % len(data) + data + b"\nendstream"
+    out, offsets = bytearray(b"%PDF-1.4\n"), {}
+    for n in sorted(objs):
+        offsets[n] = len(out)
+        out += b"%d 0 obj\n" % n + objs[n] + b"\nendobj\n"
+    xref = len(out)
+    out += b"xref\n0 %d\n0000000000 65535 f \n" % (len(objs) + 1)
+    for n in sorted(objs):
+        out += b"%010d 00000 n \n" % offsets[n]
+    out += b"trailer\n<< /Size %d %s >>\nstartxref\n%d\n%%%%EOF\n" % (len(objs) + 1, trailer, xref)
+    return bytes(out)
+
+
+def shown(text):
+    return "BT /F1 11 Tf 50 780 Td (%s) Tj ET" % text
+
+
+def have_pdftotext():
+    return "pdftotext   found" in subprocess.run([BIN, "check"], capture_output=True, text=True).stdout
+
+
+def test_pdf_real(tmp):
+    """Real PDFs through the real pdftotext."""
+    root = os.path.join(tmp, "realpdf")
+    a, b, c, d, e, f = card("4539"), card("5412"), card("6011"), card("4024"), card("3714", 15), card("3566")
+    g = card("4716")
+    write(root, "invoice.pdf", real_pdf([shown("Invoice 2026-114"), shown("Paid with card " + a)]))
+    write(root, "hex.pdf", real_pdf(["BT /F1 11 Tf 50 780 Td <%s> Tj ET" % ("card " + b).encode().hex()]))
+    write(root, "pieces.pdf", real_pdf(["BT /F1 11 Tf 50 780 Td [(card %s) 0 (%s)] TJ ET" % (c[:7], c[7:])]))
+    write(root, "scanned.pdf", real_pdf([None, None, None]))
+    write(root, "half.pdf", real_pdf([shown("cover " + d), None]))
+    write(root, "locked-open.pdf", real_pdf([shown("no password asked: " + e)], password=""))
+    write(root, "locked.pdf", real_pdf([shown("secret " + card("4539"))], password="hunter2"))
+    write(root, "nocopy.pdf", real_pdf([shown("no copying " + g)], password="", permissions=-20))
+    write(root, "broken.pdf", b"%PDF-1.4\nthis is not a PDF at all\n")
+    if have_libarchive():
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+            z.writestr("scan/statement.pdf", real_pdf([shown("statement"), shown("account " + grouped(f))]))
+        write(root, "mail.zip", buf.getvalue())
+
+    r = run(root, "-j", "2", expect=1)
+    def text_hits(rel):
+        return [(h.get("member"), h.get("page")) for h in hits_in(r, root, rel)]
+    check(text_hits("invoice.pdf") == [("(PDF text)", 2)], "compressed text is found, with its page: %s" % text_hits("invoice.pdf"))
+    check(text_hits("hex.pdf") == [("(PDF text)", 1)], "text stored as hex is found")
+    check(text_hits("pieces.pdf") == [("(PDF text)", 1)], "a number stored in pieces is found")
+    check(text_hits("locked-open.pdf") == [("(PDF text)", 1)], "an encrypted PDF that asks no password is read")
+    check(text_hits("half.pdf") == [("(PDF text)", 1)], "the pages with text of a mixed PDF are read")
+    if have_libarchive():
+        check(text_hits("mail.zip") == [("scan/statement.pdf!(PDF text)", 2)], "PDF inside a zip: %s" % text_hits("mail.zip"))
+    why = {os.path.basename(x["path"]): x for x in r["skips"]}
+    start = "not fully scanned: PDF text not read, "
+    # A PDF that forbids copying its text: the pdftotext of today reads it anyway, an older
+    # one refuses. Either it is read, or it is listed.
+    refused = "nocopy.pdf" in why
+    check(why["nocopy.pdf"]["reason"] == start + "the document does not allow its text to be copied" if refused
+          else text_hits("nocopy.pdf") == [("(PDF text)", 1)], "copy-protected PDF is read, or listed")
+    check(len(r["hits"]) == (6 if have_libarchive() else 5) + (not refused), "no other hits (%d)" % len(r["hits"]))
+    check(why.get("scanned.pdf", {}).get("reason", "").startswith("not fully scanned: PDF has no text")
+          and why["scanned.pdf"]["pages_read"] == 3, "a PDF of pictures only is listed: %s" % why.get("scanned.pdf"))
+    check("some pages have no text" in why.get("half.pdf", {}).get("reason", "")
+          and why["half.pdf"]["pages_without_text"] == 1, "a mixed PDF is listed with its page counts")
+    check(why.get("locked.pdf", {}).get("reason") == start + "password protected", "password: %s" % why.get("locked.pdf"))
+    check(why.get("broken.pdf", {}).get("reason", "").startswith(start + "pdftotext could not read the file"),
+          "broken PDF: %s" % why.get("broken.pdf"))
+    check(len(r["skips"]) == 4 + refused, "no other PDFs listed as not fully scanned (%d)" % len(r["skips"]))
+
+    r = run(root, "-s", "pdf_text=no", expect=1)
+    check(r["hits"] == [], "without the text none of these numbers is found: the byte scan cannot see them")
+
+
 def main():
     global BASE
     BASE = 0 if have_libarchive() else 1
@@ -439,6 +775,11 @@ def main():
         test_journal(tmp)
         test_health(tmp)
         test_missing_libraries(tmp)
+        test_pdf_stand_in(tmp)
+        if have_pdftotext():
+            test_pdf_real(tmp)
+        else:
+            print("SKIPPED: real PDF tests (pdftotext not found on this machine)")
         if have_libarchive():
             test_archives(tmp)
         else:

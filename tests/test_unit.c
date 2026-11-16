@@ -26,9 +26,11 @@ static struct rules R;
 static unsigned char *workbuf;
 static struct scan_result res;
 
+static int as_pdf_text;   /* 1: scan as the text of a PDF */
+
 static size_t scan_n(const char *data, size_t len, size_t chunk)
 {
-    struct scan_opts o = { .rules = &R, .keep_leading = 0, .buf = workbuf };
+    struct scan_opts o = { .rules = &R, .keep_leading = 0, .buf = workbuf, .pdf_text = as_pdf_text };
     struct mem m = { data, len, 0, chunk };
     scan_result_reset(&res);
     CHECK(scan_stream(&o, mem_read, &m, &res) == 0);
@@ -113,6 +115,31 @@ static void test_formats(void)
     snprintf(text, sizeof text, "x %.4s-%.4s %.4s-%.4s y", c, c + 4, c + 8, c + 12);   /* mixed separators */
     CHECK(scan(text) == 0);
     snprintf(text, sizeof text, "x %.4s  %.4s  %.4s  %.4s y", c, c + 4, c + 8, c + 12); /* two spaces */
+    CHECK(scan(text) == 1 && res.hits[0].ndigits == 16 && res.hits[0].offset == 2);
+    snprintf(text, sizeof text, "x %.4s  %.4s %.4s  %.4s y", c, c + 4, c + 8, c + 12);  /* two, then one */
+    CHECK(scan(text) == 0);
+    snprintf(text, sizeof text, "x %.4s   %.4s   %.4s   %.4s y", c, c + 4, c + 8, c + 12); /* three spaces */
+    CHECK(scan(text) == 0);
+    snprintf(text, sizeof text, "x\t%.4s\t%.4s\t%.4s\t%.4s\ty", c, c + 4, c + 8, c + 12); /* tabs: columns */
+    CHECK(scan(text) == 1 && res.hits[0].ndigits == 16);
+    snprintf(text, sizeof text, "x %.4s.%.4s.%.4s.%.4s y", c, c + 4, c + 8, c + 12);     /* dots */
+    CHECK(scan(text) == 1 && res.hits[0].ndigits == 16 && res.hits[0].marks == 0);
+    /* A space as a web form and a URL write it, as it ends up in an access log. */
+    snprintf(text, sizeof text, "GET /pay?card=%.4s+%.4s+%.4s+%.4s&cvc=123 HTTP/1.1", c, c + 4, c + 8, c + 12);
+    CHECK(scan(text) == 1 && res.hits[0].ndigits == 16 && res.hits[0].marks == 0);
+    snprintf(text, sizeof text, "/pay?card=%.4s%%20%.4s%%20%.4s%%20%.4s&x=1", c, c + 4, c + 8, c + 12);
+    CHECK(scan(text) == 1 && res.hits[0].ndigits == 16 && res.hits[0].offset == 10);
+    snprintf(text, sizeof text, "x %.4s%%20%.4s+%.4s%%20%.4s y", c, c + 4, c + 8, c + 12);    /* mixed */
+    CHECK(scan(text) == 0);
+    snprintf(text, sizeof text, "x %.4s%%2B%.4s%%2B%.4s%%2B%.4s y", c, c + 4, c + 8, c + 12); /* an encoded plus sign */
+    CHECK(scan(text) == 0);
+    snprintf(text, sizeof text, "x %.4s/%.4s/%.4s/%.4s y", c, c + 4, c + 8, c + 12);     /* not a separator */
+    CHECK(scan(text) == 0);
+    snprintf(text, sizeof text, "x %.4s - %.4s - %.4s - %.4s y", c, c + 4, c + 8, c + 12);
+    CHECK(scan(text) == 0);
+    snprintf(text, sizeof text, "x %.6s-%.4s-%.6s y", c, c + 6, c + 10);                 /* not a card grouping */
+    CHECK(scan(text) == 0);
+    snprintf(text, sizeof text, "x %.4s %.4s %.4s y", c, c + 4, c + 8);                  /* three groups of a 16 */
     CHECK(scan(text) == 0);
     snprintf(text, sizeof text, "x %.8s %.8s y", c, c + 8);                             /* not a card grouping */
     CHECK(scan(text) == 0);
@@ -130,6 +157,146 @@ static void test_formats(void)
     make_card("5018", 12, c);
     snprintf(text, sizeof text, "<%s>", c);
     CHECK(scan(text) == 1 && !strcmp(res.hits[0].brand, "maestro"));
+}
+
+/* Groups of four for every length a brand issues, and the layouts printed on the card. */
+static void test_brand_layouts(void)
+{
+    static const struct { const char *prefix; int n; int g[6]; const char *brand; } lay[] = {
+        { "4539", 13, { 4, 4, 4, 1 }, "visa" },       { "5018", 12, { 4, 4, 4 }, "maestro" },
+        { "3605", 14, { 4, 4, 4, 2 }, "diners" },     { "3605", 14, { 4, 6, 4 }, "diners" },
+        { "3714", 15, { 4, 4, 4, 3 }, "amex" },       { "3714", 15, { 4, 6, 5 }, "amex" },
+        { "6759", 18, { 4, 4, 4, 4, 2 }, "maestro" }, { "6221", 17, { 4, 4, 4, 4, 1 }, "unionpay" },
+        { "6500", 19, { 4, 4, 4, 4, 3 }, "discover" },
+    };
+    static const char *const seps[] = { " ", "-", ".", "\t", "  ", "+", "%20" };
+    char c[24], text[200];
+    for (size_t i = 0; i < sizeof lay / sizeof lay[0]; i++)
+        for (size_t k = 0; k < sizeof seps / sizeof seps[0]; k++) {
+            make_card(lay[i].prefix, lay[i].n, c);
+            int len = snprintf(text, sizeof text, "paid ");
+            for (int g = 0, at = 0; g < 6 && lay[i].g[g]; at += lay[i].g[g], g++)
+                len += snprintf(text + len, sizeof text - (size_t)len, "%s%.*s", g ? seps[k] : "", lay[i].g[g], c + at);
+            snprintf(text + len, sizeof text - (size_t)len, " ok");
+            size_t n = scan(text);
+            CHECK(n == 1 && res.hits[0].ndigits == lay[i].n && !strcmp(res.hits[0].brand, lay[i].brand) &&
+                  res.hits[0].offset == 5);
+            if (n != 1) printf("  layout %zu separator %zu: %zu hits\n", i, k, n);
+        }
+    /* A layout no card has: 4-6-5 is American Express only, and its prefix is not Visa's. */
+    make_card("4539", 15, c);
+    snprintf(text, sizeof text, "x %.4s %.6s %.5s y", c, c + 4, c + 10);
+    CHECK(scan(text) == 0);
+}
+
+/* UTF-16: text as Windows writes it, and as a column inside a database file. */
+static size_t scan16(const char *text, int big, int bom, const char *lead, size_t leadlen, size_t chunk)
+{
+    static char b[140000];
+    size_t n = 0;
+    memcpy(b, lead, leadlen);
+    n = leadlen;
+    if (bom) { b[n++] = (char)(big ? 0xFE : 0xFF); b[n++] = (char)(big ? 0xFF : 0xFE); }
+    for (const unsigned char *p = (const unsigned char *)text; *p; p++) {
+        /* '~' stands for a letter outside ASCII (U+0416): both of its bytes are set */
+        unsigned lo = *p == '~' ? 0x16 : *p, hi = *p == '~' ? 0x04 : 0;
+        b[n++] = (char)(big ? hi : lo);
+        b[n++] = (char)(big ? lo : hi);
+    }
+    return scan_n(b, n, chunk);
+}
+
+static void test_utf16(void)
+{
+    static char lead[70000];
+    char c[24], text[300];
+    make_card("4539", 16, c);
+    for (int big = 0; big <= 1; big++)
+        for (int bom = 0; bom <= 1; bom++) {
+            snprintf(text, sizeof text, "card %s paid", c);
+            CHECK(scan16(text, big, bom, "", 0, 0) == 1);
+            CHECK(res.hits[0].ndigits == 16 && !strcmp(res.hits[0].brand, "visa") && res.hits[0].marks == 0);
+            CHECK(res.hits[0].offset == (uint64_t)(bom ? 2 : 0) + 10 + (uint64_t)big);   /* the first digit's byte */
+            snprintf(text, sizeof text, "%s", c);                                         /* the whole file */
+            CHECK(scan16(text, big, bom, "", 0, 0) == 1);
+            snprintf(text, sizeof text, "x %.4s %.4s %.4s %.4s y\r\n", c, c + 4, c + 8, c + 12);
+            CHECK(scan16(text, big, bom, "", 0, 0) == 1 && res.hits[0].ndigits == 16);
+            snprintf(text, sizeof text, "x\t%.4s-%.4s-%.4s-%.4s\ty", c, c + 4, c + 8, c + 12);
+            CHECK(scan16(text, big, bom, "", 0, 0) == 1);
+            snprintf(text, sizeof text, "~%s~", c);                  /* letters outside ASCII are not word characters */
+            CHECK(scan16(text, big, bom, "", 0, 0) == 1);
+            snprintf(text, sizeof text, "ref%s paid", c);            /* glued to a word */
+            CHECK(scan16(text, big, bom, "", 0, 0) == 0);
+            snprintf(text, sizeof text, "paid %sabc", c);
+            CHECK(scan16(text, big, bom, "", 0, 0) == 0);
+            snprintf(text, sizeof text, "paid 9%s7 x", c);           /* inside a longer number */
+            CHECK(scan16(text, big, bom, "", 0, 0) == 0);
+            snprintf(text, sizeof text, "paid %.15s%c x", c, c[15] == '9' ? '0' : c[15] + 1);
+            CHECK(scan16(text, big, bom, "", 0, 0) == 0);            /* check digit wrong */
+            snprintf(text, sizeof text, "a %s b %s c", c, c);        /* two numbers, each once */
+            CHECK(scan16(text, big, bom, "", 0, 0) == 2);
+            snprintf(text, sizeof text, "imei: %s\r\n", c);
+            CHECK(scan16(text, big, bom, "", 0, 0) == 1 && marked(0, R_ID_KEYWORD));
+        }
+    /* Inside a binary file, after bytes of something else, at an odd and an even offset, and
+     * across the block boundary whatever the size of the reads. */
+    memset(lead, 0xC3, sizeof lead);
+    snprintf(text, sizeof text, " %s ", c);
+    for (size_t at = 0; at < 2; at++)
+        for (size_t chunk = 0; chunk <= 7; chunk += 7) {
+            CHECK(scan16(text, 0, 0, lead, 1000 + at, chunk) == 1 && res.hits[0].offset == 1000 + at + 2);
+            for (size_t near = 65536 - 140; near < 65536 + 8; near += 3)
+                CHECK(scan16(text, 0, 0, lead, near + at, chunk) == 1);
+        }
+    /* Plain text is read as before: a digit, a zero byte and a digit do not make it UTF-16. */
+    CHECK(scan_n("4\0005\0003", 5, 0) == 0);
+    snprintf(text, sizeof text, "card %s paid", c);
+    CHECK(scan(text) == 1 && res.hits[0].offset == 5);
+}
+
+/* The text of a PDF as pdftotext lays it out: groups several spaces or one line break apart. */
+static void test_pdf_text(void)
+{
+    char c[24], a[24], text[400];
+    make_card("4539", 16, c);
+    make_card("3714", 15, a);
+    static const char *const fmt[] = {
+        "Jansen        %.4s      %.4s    %.4s     %.4s     10,00",      /* table cells, uneven gaps */
+        "tabs:   %.4s    %.4s                      %.4s      %.4s",       /* tab stops */
+        "the card number %.4s %.4s\n%.4s %.4s is broken over two lines",  /* end of a line */
+        "the card number %.4s %.4s\r\n    %.4s %.4s after an indent",
+        "number %.4s\n%.4s %.4s %.4s.",
+        "plain %.4s %.4s %.4s %.4s too",
+    };
+    for (size_t i = 0; i < sizeof fmt / sizeof fmt[0]; i++) {
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-nonliteral"
+        snprintf(text, sizeof text, fmt[i], c, c + 4, c + 8, c + 12);
+#pragma GCC diagnostic pop
+        as_pdf_text = 1;
+        size_t n = scan(text);
+        CHECK(n == 1 && res.hits[0].ndigits == 16 && res.hits[0].marks == 0);
+        if (n != 1) printf("  pdf text %zu: %zu hits\n", i, n);
+        as_pdf_text = 0;                                  /* in any other file only the last one is a number */
+        CHECK(scan(text) == (i == 5 ? 1u : 0u));
+    }
+    as_pdf_text = 1;
+    snprintf(text, sizeof text, "amex   %.4s    %.6s   %.5s  paid", a, a + 4, a + 10);
+    CHECK(scan(text) == 1 && res.hits[0].ndigits == 15);
+    snprintf(text, sizeof text, "x %.4s-%.4s-%.4s-%.4s y", c, c + 4, c + 8, c + 12);     /* the other separators as ever */
+    CHECK(scan(text) == 1);
+    snprintf(text, sizeof text, "x %.4s\n%.4s\n%.4s\n%.4s y", c, c + 4, c + 8, c + 12);  /* a column of numbers */
+    CHECK(scan(text) == 0);
+    snprintf(text, sizeof text, "x %.4s %.4s\n\n%.4s %.4s y", c, c + 4, c + 8, c + 12);  /* an empty line between */
+    CHECK(scan(text) == 0);
+    snprintf(text, sizeof text, "x %.4s %.4s\f%.4s %.4s y", c, c + 4, c + 8, c + 12);    /* the next page */
+    CHECK(scan(text) == 0);
+    snprintf(text, sizeof text, "x %.4s %.4s%30s%.4s %.4s y", c, c + 4, "", c + 8, c + 12); /* too far apart */
+    CHECK(scan(text) == 0);
+    snprintf(text, sizeof text, "x %.4s  %.4s  %.4s  %.4s\n123 y", c, c + 4, c + 8, c + 12); /* then a short line */
+    /* One hit: the 16 digits, or all 19 when those happen to be a valid number too. */
+    CHECK(scan(text) == 1 && (res.hits[0].ndigits == 16 || res.hits[0].ndigits == 19));
+    as_pdf_text = 0;
 }
 
 static void test_boundaries(void)
@@ -307,6 +474,9 @@ int main(void)
     rules_defaults(&R);
     test_number_checks();
     test_formats();
+    test_brand_layouts();
+    test_utf16();
+    test_pdf_text();
     test_boundaries();
     test_block_boundaries();
     test_tracks();

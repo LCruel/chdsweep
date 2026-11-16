@@ -4,4 +4,6 @@
 # mails on a problem. Settings come from /etc/chdsweep.conf; the run file goes to
 # /var/log/chdsweep. The exit code is the health of the run (0 full coverage, 1 partial,
 # 2 failed, 3 the previous run is still going), never whether cards were found.
-30 2 * * 0  root  /usr/bin/chdsweep scan -q
+#
+# "test -x" keeps cron quiet when the package was removed and this file is still here.
+30 2 * * 0  root  test -x /usr/bin/chdsweep && /usr/bin/chdsweep scan -q

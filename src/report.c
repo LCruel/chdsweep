@@ -30,7 +30,7 @@ struct run {
     int complete, latest, prev;
     struct strlist paths, excludes;   /* the paths the run was given, and what it left out */
     long long max_file_size, max_unpacked, max_depth, max_ratio, max_members, max_file_seconds,
-              max_hits_per_file;
+              max_hits_per_file, max_pdf_pages, max_pdf_size;
     long long files, bytes, archives, skipped;
     long open, likely, accepted;
 };
@@ -151,6 +151,8 @@ static int load_run(const char *file)
             r->max_members = json_num(lim, "max_members", 0);
             r->max_file_seconds = json_num(lim, "max_file_seconds", 0);
             r->max_hits_per_file = json_num(lim, "max_hits_per_file", 0);
+            r->max_pdf_pages = json_num(lim, "max_pdf_pages", 0);
+            r->max_pdf_size = json_num(lim, "max_pdf_size", 0);
             int jd = (int)json_num(v, "journal_days", 0);
             if (jd > 0) {
                 char jn[64];
@@ -389,6 +391,7 @@ static const char *file_type(const struct rhit *h)
 {
     static char ext[40];
     const char *p = h->path;
+    if (h->member && ends_with(h->member, "(PDF text)")) return "PDF text";
     if (h->member)
         return ends_with(p, ".docx") || ends_with(p, ".xlsx") || ends_with(p, ".pptx") ? "office document"
                                                                                          : "archive member";
@@ -485,7 +488,8 @@ static void section_files(struct doc *d)
         sb_reset(&where);
         sb_add(&where, path);
         /* "(content)" is a single compressed file, not a file inside an archive */
-        if (member[0] && strcmp(member, "(content)")) sb_printf(&where, " (inside it: %s)", member);
+        if (!strcmp(member, "(PDF text)")) sb_add(&where, " (in its text)");
+        else if (member[0] && strcmp(member, "(content)")) sb_printf(&where, " (inside it: %s)", member);
         doc_row(d, t, g->key, where.s, masked, g->note, issuer, N(g->hits));
     }
     sb_free(&where);
@@ -696,10 +700,35 @@ static const char *skip_criterion(const struct skip *s)
         snprintf(o, sizeof o, "At most %lld numbers are listed per file (setting max_hits_per_file). The file was "
                               "read to the end; the numbers beyond that are counted in the run file, not listed.",
                  r->max_hits_per_file);
+    else if (strstr(why, "max_pdf_pages"))
+        snprintf(o, sizeof o, "The text of the first %lld pages of a PDF is read (setting max_pdf_pages); "
+                              "the pages after that are not.", r->max_pdf_pages);
+    else if (strstr(why, "max_pdf_size"))
+        snprintf(o, sizeof o, "The text of a PDF larger than %s is not read (setting max_pdf_size). Its bytes "
+                              "are scanned, which finds only what is stored uncompressed.", size_text(r->max_pdf_size));
+    else if (strstr(why, "pdftotext not available"))
+        snprintf(o, sizeof o, "The text inside PDF files is read by the program pdftotext (package poppler-utils), "
+                              "which is missing on the host. The bytes of the PDF are scanned, which finds only "
+                              "what is stored uncompressed.");
+    else if (strstr(why, "pdf_text is off"))
+        snprintf(o, sizeof o, "Reading the text inside PDF files is switched off (setting pdf_text). The bytes of "
+                              "the PDF are scanned, which finds only what is stored uncompressed.");
+    else if (strstr(why, "no text"))
+        snprintf(o, sizeof o, "Pages without text are scanned pictures or empty pages. Pictures are not read: "
+                              "a card number in a picture is not found.");
+    else if (strstr(why, "password protected"))
+        snprintf(o, sizeof o, "The PDF needs a password to open, so its text could not be read.");
+    else if (strstr(why, "does not allow its text"))
+        snprintf(o, sizeof o, "The PDF is protected against copying its text, and the pdftotext on the host refuses to read "
+                              "such a PDF. Newer versions read it.");
+    else if (strstr(why, "PDF text not read"))
+        snprintf(o, sizeof o, "pdftotext could not read the PDF: a damaged file, one that needed more memory "
+                              "than allowed (setting max_pdf_memory), or a fault in pdftotext. The bytes of the "
+                              "PDF are scanned.");
     else if (strstr(why, "libarchive"))
         snprintf(o, sizeof o, "Archives are not opened because the library for them (libarchive) is missing on the host.");
     else if (strstr(why, "journalctl"))
-        snprintf(o, sizeof o, "The system journal could not be read with journalctl.");
+        snprintf(o, sizeof o, "The system journal could not be read: journalctl failed, with its own error in brackets.");
     else if (strstr(why, "path not found"))
         snprintf(o, sizeof o, "A path given to the scan does not exist on the host.");
     else if (strstr(why, "unreadable") || strstr(why, "read error"))

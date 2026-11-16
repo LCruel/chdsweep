@@ -23,6 +23,10 @@ void config_defaults(struct config *c)
     c->lock_file = xstrdup("/run/chdsweep.lock");
     c->nice_level = 10;
     c->ionice_idle = 1;
+    c->pdf_text = 1;
+    c->max_pdf_pages = 2000;
+    c->max_pdf_size = 100ULL << 20;
+    c->max_pdf_memory = 1ULL << 30;
 }
 
 static int parse_size(const char *v, uint64_t *out)
@@ -86,6 +90,10 @@ int config_set(struct config *c, const char *key, const char *val, char *err, si
     else if (!strcmp(key, "journal_days")) { bad = parse_int(val, 0, 3650, &n); c->journal_days = (int)n; }
     else if (!strcmp(key, "progress")) bad = parse_yes(val, &c->progress);
     else if (!strcmp(key, "require_all_libraries")) bad = parse_yes(val, &c->require_all_libraries);
+    else if (!strcmp(key, "pdf_text")) bad = parse_yes(val, &c->pdf_text);
+    else if (!strcmp(key, "max_pdf_pages")) { bad = parse_int(val, 0, 1000000000, &n); c->max_pdf_pages = n; }
+    else if (!strcmp(key, "max_pdf_size")) bad = parse_size(val, &c->max_pdf_size);
+    else if (!strcmp(key, "max_pdf_memory")) bad = parse_size(val, &c->max_pdf_memory);
     else if (!strcmp(key, "keep_leading")) {
         if (!strcmp(val, "auto") || !strcmp(val, "8")) c->keep_leading = 0;   /* 8 is the same as auto */
         else if (!strcmp(val, "6")) c->keep_leading = 6;
@@ -108,9 +116,10 @@ int config_load(struct config *c, const char *path, char *err, size_t errlen)
         lineno++;
         char *s = line;
         while (isspace((unsigned char)*s)) s++;
+        cut_comment(s);   /* also after a value: "threads = 1   # one worker" */
         char *e = s + strlen(s);
         while (e > s && isspace((unsigned char)e[-1])) *--e = 0;
-        if (!*s || *s == '#') continue;
+        if (!*s) continue;
         char *eq = strchr(s, '=');
         if (!eq) { snprintf(err, errlen, "%s:%d: expected key = value", path, lineno); fclose(f); return -1; }
         char *k = s, *ke = eq, *v = eq + 1;

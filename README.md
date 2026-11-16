@@ -6,80 +6,91 @@ chdsweep searches a server's file system for payment card numbers (PANs) and tra
 
 **Status:** in development. The scanner and the combined report work. Still open are mainly packaging, CI and rpm support.
 
-## Build and try
+## Try it on a server
 
-Needs a C compiler, `make` and the zlib headers (`zlib1g-dev` on Debian and Ubuntu, `zlib-devel` on RHEL, `zlib-dev` on Alpine). libarchive and libcrypto are loaded at run time, so they are not needed to build.
-
-```
-make                 # build/chdsweep
-make test            # unit tests, then a generated corpus against the binary
-make asan            # the same under AddressSanitizer and UndefinedBehaviorSanitizer
-tools/test-distros.sh  # make test as root in Debian, Ubuntu, Rocky and Alpine containers (needs Docker)
-```
+Copy the static binary to the server and run it as root. It needs nothing installed.
 
 ```
-build/chdsweep check                                  # which optional libraries are there
-build/chdsweep scan --no-lock -o run.jsonl /var/www   # one run, one JSON Lines run file
-```
-
-Settings come from `/etc/chdsweep.conf` ([example](etc/chdsweep.conf.example)) and the false-positive rules from `/etc/chdsweep/fp-rules.conf` ([example](etc/fp-rules.conf.example)); both are optional. `chdsweep help` lists the options.
-
-The run file has a `header` line, one `hit` line per number (masked, with brand, offset and the marks of the false-positive rules), one `skip` line per file that was not or not fully scanned, and an `end` line with the counters. A run file without an `end` line is incomplete.
-
-Exit codes report the health of the run, never whether cards were found: 0 full coverage, 1 partial coverage, 2 failed, 3 another run holds the lock.
-
-## First test run on a server
-
-`tools/build-release.sh` (needs Docker) builds two files into `dist/` and tries each on a clean system:
-
-| File | For | Needs on the server |
-|---|---|---|
-| `chdsweep-<version>-static-x86_64`, `-static-arm64` | copying onto any Linux server (Intel/AMD or 64-bit ARM, check with `uname -m`) and running it there | nothing |
-| `chdsweep_<version>_amd64.deb` | Debian 11+ and Ubuntu 20.04+, uses the distribution's libraries | `zlib1g`; `libarchive13` for archives; `libssl` for the `package-file` rule |
-
-A first run by hand, as root, with the static binary:
-
-```
-scp dist/chdsweep-*-static-x86_64 root@server:/root/chdsweep
+scp chdsweep-<version>-static-x86_64 root@server:/root/chdsweep   # -static-arm64 on ARM; check with uname -m
 ssh root@server
-./chdsweep check                                    # the static build has everything built in
-./chdsweep scan --no-lock -o /root/run.jsonl      # the default scope, see below
-./chdsweep scan --no-lock -o /root/all.jsonl /    # or everything on the root file system
+./chdsweep check                         # what this host has for a full scan, and what is missing
+./chdsweep scan --no-lock -o run.jsonl   # /root, /home, the current logs and the journal of the last 35 days
 ```
 
-Without a path, a scan covers `/root`, `/home`, the current logs in `/var/log` and the system journal of the last 35 days (read from `journalctl`; nothing is written). Rotated and compressed logs under `/var/log` are ignored. Paths, excludes and the journal period can be set on the command line (`-x`, `-s journal_days=N`, paths) or in a config file (`-c FILE`, default `/etc/chdsweep.conf`); `etc/pan-scan.conf.example` is the default scope written out. An exclude that starts with a folder (`/var/log/*.gz`) applies under that folder only; a pattern without one (`*.iso`) applies everywhere.
+Then copy `run.jsonl` to your own machine and make the report there:
 
-What to expect and check:
+```
+chdsweep report -o first-run run.jsonl   # first-run.md, first-run.html and first-run.csv
+```
 
-- **It only reads.** It runs at low CPU and I/O priority and writes one file, the run file. It prints nothing while it works and a short summary at the end; add `-p` to see what each worker is doing. Ctrl-C stops it and marks the run file as incomplete.
-- **Disk load.** A scan reads every file in its scope, so it competes with the server's own disk use and pushes other data out of the file cache. By default one worker reads, at low priority. The low I/O priority only has an effect with the `bfq` I/O scheduler; with `none` or `mq-deadline`, which most servers use, it does nothing. On a busy server set a ceiling that works everywhere: `-s max_read_rate=20M` reads at most 20 MB per second. On a quiet server `-j 4` finishes sooner.
-- **At most 10,000 numbers are listed per file.** A file with more is read to the end and the rest are counted (`hits_not_listed` in the run file), so one file full of numbers cannot use up the server's memory or fill the disk with the run file. Change it with `-s max_hits_per_file=N`; 0 is no limit.
-- **One file system per path.** A run stays on the file system of each path it is given. At the end it lists the folders it did not enter (for example `/var` or `/home` on their own file system); add those as extra paths to search them. Network mounts are left out the same way, which is usually what you want.
-- **Exit code 1 is normal** on a first run: it means some files were not or not fully scanned (unreadable, over a limit, a broken archive). The run file and the report say which.
-- **Then make the report** on your own machine, not on the server: copy `run.jsonl` back and run `chdsweep report -o first-run run.jsonl`. Start with the suspected PANs; the likely false positives are listed per rule.
+Good to know before the first run:
 
-Once the result looks right, install the `.deb`, copy `/usr/share/doc/chdsweep/chdsweep.conf.example` to `/etc/chdsweep.conf` and the cron example to `/etc/cron.d/chdsweep`. Installing the package starts nothing by itself.
+- **It only reads.** One worker at low priority, and one file written: the run file.
+- **Exit code 1 is normal on a first run.** It means some files were not or not fully scanned; the report says which and why.
+- **To scan more,** give paths: `./chdsweep scan --no-lock -o all.jsonl /` scans the whole root file system.
 
-Not covered yet: the `package-file` rule only knows the dpkg database, so on RHEL-family servers unchanged package files are not marked; bz2, xz and zstd files are not unpacked; PDF text is not read.
+Scope, limits, disk load and the run file are in [docs/scanning.md](docs/scanning.md).
+
+## Install for scheduled scans
+
+On Debian 10+ and Ubuntu 20.04+:
+
+```
+apt install ./chdsweep_<version>_amd64.deb     # _arm64.deb on ARM
+cp /usr/share/doc/chdsweep/chdsweep.cron.example /etc/cron.d/chdsweep
+```
+
+The package places `/etc/chdsweep.conf` with every setting at its default; change what you need, and an upgrade keeps your changes. Installing the package starts nothing by itself; the cron file does. `apt remove chdsweep` keeps your config and the run files; `apt purge chdsweep` also removes the config, the rules and the cron file, and keeps only the run files in `/var/log/chdsweep`.
+
+To check an installation, run the self test that comes with the package. It scans a few files it makes itself, with made-up numbers, and ends with "14 passed, 0 failed":
+
+```
+sh /usr/share/chdsweep/selftest.sh
+```
+
+On any other Linux, put the static binary in `/usr/local/bin` and copy [chdsweep.conf.example](etc/chdsweep.conf.example) to `/etc/chdsweep.conf` and [chdsweep.cron.example](etc/chdsweep.cron.example) to `/etc/cron.d/chdsweep`; in the cron file, change the path to `/usr/local/bin/chdsweep`.
+
+## What it needs
+
+chdsweep uses what a server already has. Two parts are optional:
+
+| Part | Used for | Without it |
+|---|---|---|
+| libarchive | tar, zip and gz archives, office documents | archives are listed as not scanned (the static binary has it built in) |
+| `pdftotext`, from the package `poppler-utils` | the text inside PDF files | each PDF is listed as not fully scanned |
+
+`chdsweep check` shows what is there and, for anything missing, the effect and how to install it. If chdsweep does not start at all, see [docs/troubleshooting.md](docs/troubleshooting.md).
+
+## What it detects
+
+A number is reported when a card brand issues it (first digits and length), its check digit is right, and it stands apart from other letters and digits. Lengths from 12 to 19 digits; Visa, Mastercard, American Express, Diners Club, Discover, JCB, UnionPay, Maestro and Mir.
+
+| Written as | Example |
+|---|---|
+| without separators | `4556737586899855` |
+| in groups of four | `4556 7375 8689 9855` |
+| as printed on the card (American Express, Diners Club) | `3714 496353 98431` |
+| with a space, dash, dot, tab or two spaces between the groups | `4556-7375-8689-9855` |
+| as a web form or URL writes the spaces, in an access log | `4556+7375+8689+9855`, `4556%207375%20...` |
+| magnetic stripe track 1 and track 2 | `;4556737586899855=2712...` |
+
+It reads every file in the scope as bytes, also inside archives, office documents and PDF text, in ASCII, UTF-8 and UTF-16. The full list, what is not detected and the false-positive rules are in [docs/detection.md](docs/detection.md).
 
 ## Report
 
 Collect the run files of all hosts and dates on one machine and merge them:
 
 ```
-build/chdsweep report -o pci-2026-11 --triage triage.csv runs/*.jsonl
+chdsweep report -o pci-2026-11 --triage triage.csv runs/*.jsonl
 ```
 
-This writes `pci-2026-11.md`, `pci-2026-11.html` (one self-contained page) and `pci-2026-11.csv` (every hit, for a spreadsheet). The newest run of each host is its current state; older runs of the same host give the trend and the differences against the previous run.
+The report shows the suspected PANs, the likely false positives with the rule that marked them, where they are, whose cards they are (brand, issuer, country) and what was not scanned. The newest run of each host is its current state; older runs give the trend. More in [docs/report.md](docs/report.md).
 
-- **Kinds of hits, never added together:** suspected PANs (no rule marks them; a person must look), likely false positives (marked by a rule, with the reason) and, only when a triage file is given, accepted false positives (with who decided and when).
-- **Where:** per location, then every file with each masked number in it, per host, per file type, host by brand. All counts are occurrences.
-- **Whose:** per brand, issuer, country and card type. The issuer comes from a BIN table built into the binary and is looked up offline; nothing is ever sent anywhere.
-- **Coverage:** what was not or not fully scanned, per host and reason.
+## Not covered yet
 
-The triage file ([example](etc/triage.csv.example)) is applied in the report only; the run files stay as they are. Entries that match nothing are listed as stale, entries older than 12 months for review.
-
-`chdsweep bin-update --commit HASH bin-list-data.csv` turns a newer download of the BIN data set into a dated table in `/var/lib/chdsweep/bin`, which then replaces the built-in one. chdsweep never downloads anything itself. Local corrections go in `/etc/chdsweep/bin-overrides.csv`, in the same six-field format, and may use eight-digit prefixes.
+- The `package-file` rule only knows the dpkg database, so on RHEL-family servers unchanged package files are not marked.
+- bz2, xz and zstd files are not unpacked.
+- Pictures are not read, so a card number in a scanned PDF or a photo is not found, also not when the same page has text.
 
 ## Why
 
@@ -92,9 +103,12 @@ PCI DSS asks an organisation to confirm where account data lives. The open-sourc
 - **Nothing written to disk except the result.** Archives and documents are unpacked in memory.
 - **Read-only and gentle.** Never changes a scanned file, runs at low CPU and I/O priority, stays on one file system.
 - **False positives are marked, not hidden.** Common look-alikes (test cards, IMEIs, IDs, package files) are flagged with the rule and reason, and kept in the report so the triage can be checked.
-- **Portable.** One binary that depends only on well-known libraries (libc, zlib, libarchive, libcrypto), also built fully static. No plugins; rules and tables are plain data files.
-- **Clear about missing libraries.** If an optional library is missing, chdsweep says what is affected and how to install it, scans what it can, and reports the rest as not scanned. `chdsweep check` tests a machine before the first run.
-- **Coverage is reported.** Every file skipped (too large, unreadable, too deeply nested) is counted with its reason, so a clean result only claims what was searched.
+- **Few outside parts, and clear about a missing one.** One binary, also built fully static. If an optional part is missing, chdsweep says what is affected and how to install it, scans what it can, and reports the rest as not scanned.
+- **Coverage is reported.** Every file skipped is counted with its reason, so a clean result only claims what was searched.
+
+## Building
+
+`make` builds `build/chdsweep`; it needs a C compiler and the zlib headers. The tests, the release files and the test report that is written with every release are in [docs/building.md](docs/building.md).
 
 ## Licence
 

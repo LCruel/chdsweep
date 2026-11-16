@@ -13,7 +13,7 @@ static void usage(FILE *f)
         "  chdsweep scan [options] [path ...]   search for card numbers, write a run file\n"
         "  chdsweep report [options] RUN ...    merge run files into one report (md, html, csv)\n"
         "  chdsweep bin-update FILE             make a dated BIN table from a downloaded data set\n"
-        "  chdsweep check                       list the optional libraries, found or missing\n"
+        "  chdsweep check                       list the optional libraries and pdftotext, found or missing\n"
         "  chdsweep version\n"
         "\n"
         "Without a path, in the config file or on the command line, scan searches /root,\n"

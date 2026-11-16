@@ -71,8 +71,9 @@ int rules_load(struct rules *r, const char *path, char *err, size_t errlen)
     while (fgets(line, sizeof line, f)) {
         lineno++;
         sum = fnv1a64(line, strlen(line), sum);
+        cut_comment(line);   /* also after a value */
         char *s = trim(line);
-        if (!*s || *s == '#') continue;
+        if (!*s) continue;
         char *eq = strchr(s, '=');
         if (!eq) { snprintf(err, errlen, "%s:%d: expected key = value", path, lineno); fclose(f); return -1; }
         *eq = 0;

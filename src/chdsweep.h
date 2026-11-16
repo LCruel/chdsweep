@@ -2,13 +2,14 @@
 #ifndef CHDSWEEP_H
 #define CHDSWEEP_H
 
+#include <signal.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <sys/types.h>
 #include <time.h>
 
-#define CHD_VERSION "0.1.0"
+#define CHD_VERSION "0.4.1"
 
 /* Exit codes: health of the run, never whether cards were found. */
 enum { EXIT_FULL = 0, EXIT_PARTIAL = 1, EXIT_FAILED = 2, EXIT_LOCKED = 3 };
@@ -87,6 +88,8 @@ struct scan_opts {
     unsigned char *buf;              /* work buffer of SCAN_BUF_SIZE bytes */
     int hit_limit;                   /* 1: keep at most hit_room hits, count the rest */
     size_t hit_room;
+    int pdf_text;                    /* the text of a PDF, as pdftotext lays it out: the groups of a
+                                      * number may be several spaces or one line break apart */
 };
 #define SCAN_BUF_SIZE (64 * 1024 + 256)
 
@@ -103,6 +106,7 @@ void mark_reason(int rule, const struct hit *h, const struct scan_result *res,
 /* ---- libs.c: libarchive and libcrypto, loaded at run time ---- */
 struct libs {
     int have_archive, have_crypto;
+    int md5_ok;                  /* libcrypto is there and lets MD5 be used (not so in FIPS mode) */
     char archive_name[32], crypto_name[32];
     char archive_version[96], crypto_version[96];
 
@@ -135,9 +139,54 @@ struct libs {
 };
 extern struct libs L;
 void libs_load(void);
-/* Message for a missing library ("archive" or "crypto"), with the fix for this distribution. */
+/* Message for a missing library ("archive", "crypto" or "pdftotext"), with the fix for this distribution. */
 void libs_missing_message(const char *which, struct strbuf *out);
+/* Looks a program up in PATH and the usual places, without a shell. 1 and its path when found. */
+int find_program(const char *name, char *path, size_t pathlen);
+int find_journalctl(char *path, size_t pathlen);
+/* Why the package-file rule cannot work on this host, or PKG_OK. Call after libs_load(). */
+enum { PKG_OK, PKG_NO_DB, PKG_NO_CRYPTO, PKG_NO_MD5 };
+int pkgrule_state(void);
+void pkgrule_message(int state, struct strbuf *out);
+/* Notices about the host, each with its effect and, where there is one, the fix. */
+void not_root_message(struct strbuf *out);
+void no_journal_message(int asked_for, struct strbuf *out);
 int cmd_check(void);
+
+/* ---- pdf.c: text inside PDF files, from an installed pdftotext run as a child process ---- */
+struct pdf_tool {
+    int have;
+    int by_proc;                 /* the child opens the file through /proc/self/fd */
+    char path[4096];
+    char version[64];
+};
+extern struct pdf_tool PDF;
+void pdf_probe(void);
+
+enum { PDF_OK, PDF_PASSWORD, PDF_NO_COPY, PDF_BROKEN, PDF_SIGNAL, PDF_TIMEOUT, PDF_STOPPED, PDF_NOT_STARTED };
+struct pdf_run {
+    pid_t pid;
+    int out_fd, err_fd;
+    double deadline;             /* now_seconds() value; 0: none */
+    const volatile sig_atomic_t *stop;
+    long max_pages;              /* 0: no limit */
+    uint64_t pos;                /* bytes of text handed out */
+    uint64_t *page_start;        /* [i]: text offset where page i + 2 starts */
+    size_t npages, cap;
+    long pages, empty;           /* pages read, and pages without any text */
+    int page_has_text, at_limit, done;
+    int more_pages, timed_out, stopped;
+    int code;                    /* exit code, or the signal for PDF_SIGNAL */
+    char err[256];               /* the first of what pdftotext said */
+    size_t errlen;
+};
+/* Starts pdftotext on the open file fd. -1: could not be started. */
+int pdf_start(struct pdf_run *p, int fd, long max_pages, uint64_t max_memory, int cpu_seconds,
+              double deadline, const volatile sig_atomic_t *stop);
+ssize_t pdf_read(void *cookie, void *buf, size_t n);         /* a scan_read_fn */
+int pdf_finish(struct pdf_run *p);                           /* a PDF_ value; stops the child */
+long pdf_page_of(const struct pdf_run *p, uint64_t offset);  /* page of a text offset, from 1 */
+void pdf_free(struct pdf_run *p);
 
 /* ---- config.c ---- */
 struct config {
@@ -161,6 +210,10 @@ struct config {
     int progress;                /* off unless asked for: chdsweep is made for cron */
     int journal_days;            /* system journal of the last N days; 0 off, -1 not set */
     int require_all_libraries;
+    int pdf_text;                /* hand PDF files to pdftotext */
+    long max_pdf_pages;          /* pages read per PDF; 0: no limit */
+    uint64_t max_pdf_size;       /* larger PDFs are not handed over; 0: no limit */
+    uint64_t max_pdf_memory;     /* memory limit of the pdftotext child; 0: no limit */
 };
 void config_defaults(struct config *c);
 int config_load(struct config *c, const char *path, char *err, size_t errlen);
@@ -169,6 +222,8 @@ int config_set(struct config *c, const char *key, const char *val, char *err, si
 /* ---- pkgdb.c ---- */
 /* 1 when the file is an unchanged file of an installed dpkg package. */
 int pkgdb_unchanged(int dirfd, const char *name, const char *path, char *pkg, size_t pkglen);
+/* 1 when this host has a dpkg database with file checksums; dir gets the folder looked in. */
+int pkgdb_present(char *dir, size_t dirlen);
 
 /* ---- run.c ---- */
 int cmd_scan(struct config *cfg, const char *config_path);
@@ -180,6 +235,8 @@ int smap_find(const struct smap *m, const char *key);       /* id, or -1 */
 void smap_free(struct smap *m);
 /* Splits a CSV line in place (quoted fields, "" for a quote). Returns the number of fields. */
 int csv_split(char *line, char **fields, int max);
+/* Cuts the comment off a line of a settings file: a # at the start or after white space. */
+void cut_comment(char *line);
 
 /* ---- json.c: reader for the run files ---- */
 enum { J_NULL, J_BOOL, J_NUM, J_STR, J_ARR, J_OBJ };

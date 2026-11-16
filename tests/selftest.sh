@@ -2,6 +2,7 @@
 # chdsweep self-test, to run on the target server after copying or installing the binary.
 #
 #   sh selftest.sh /path/to/chdsweep
+#   sh /usr/share/chdsweep/selftest.sh        the copy that comes with the .deb
 #
 # Makes a few files with made-up, Luhn-valid numbers in its own temporary folder, scans
 # only that folder, checks the result and removes the folder. It reads nothing else on
@@ -25,13 +26,33 @@ printf ';4539148803436467=27121010000000000?\n'        > "$T/data/track2.dat"
 printf 'test 4111111111111111\n'                       > "$T/data/testcard.txt"
 printf 'too long 12345391488034364679 and bad 4539148803436468\n' > "$T/data/not-cards.txt"
 printf 'archived 4539148803436467\n' | gzip            > "$T/data/old.log.gz"
+# A PDF of one page. The number is split inside the text operator, as PDF writers do, so
+# the bytes of the file do not show it: only reading the text of the PDF finds it.
+p() { printf '%s\n' "$1"; }
+{
+    p '%PDF-1.4'
+    p '1 0 obj'; p '<< /Type /Catalog /Pages 2 0 R >>'; p 'endobj'
+    p '2 0 obj'; p '<< /Type /Pages /Kids [3 0 R] /Count 1 >>'; p 'endobj'
+    p '3 0 obj'
+    p '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>'
+    p 'endobj'
+    p '4 0 obj'; p '<< /Length 84 >>'; p 'stream'
+    p 'BT /F1 12 Tf 72 720 Td [(invoice paid with 601100) -20 (0990139424 on monday)] TJ ET'
+    p 'endstream'; p 'endobj'
+    p '5 0 obj'; p '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>'; p 'endobj'
+    p 'xref'; p '0 6'
+    p '0000000000 65535 f '; p '0000000009 00000 n '; p '0000000058 00000 n '
+    p '0000000115 00000 n '; p '0000000241 00000 n '; p '0000000375 00000 n '
+    p 'trailer'; p '<< /Size 6 /Root 1 0 R >>'; p 'startxref'; p '445'; p '%%EOF'
+} > "$T/data/invoice.pdf"
 
 "$BIN" version >"$T/version" 2>&1
 check "the binary starts" "$(count '^chdsweep ' "$T/version")" 1
 "$BIN" check >"$T/check" 2>&1
 have_archive=$(count 'libarchive  found' "$T/check")
 have_crypto=$(count 'libcrypto   found' "$T/check")
-echo "info  libarchive: $have_archive, libcrypto: $have_crypto (1 = found)"
+have_pdf=$(count 'pdftotext   found' "$T/check")
+echo "info  libarchive: $have_archive, libcrypto: $have_crypto, pdftotext: $have_pdf (1 = found)"
 
 "$BIN" scan -q --no-lock -o "$T/run.jsonl" "$T/data" 2>"$T/stderr"
 code=$?
@@ -43,13 +64,21 @@ check "number with dashes (4-6-5)" "$(grep 'dashes.csv' "$R" | grep -c '"brand":
 check "track 2 data" "$(grep 'track2.dat' "$R" | grep -c '"track":2')" 1
 check "test card is marked, not hidden" "$(grep 'testcard.txt' "$R" | grep -c '"rule":"test-card"')" 1
 check "longer number and failed check digit are not hits" "$(count 'not-cards.txt' "$R")" 0
-check "no full number in the run file" "$(grep -c -e 4539148803436467 -e 5412751234123452 -e 378282246310005 "$R")" 0
+check "no full number in the run file" "$(grep -c -e 4539148803436467 -e 5412751234123452 -e 378282246310005 -e 6011000990139424 "$R")" 0
 if [ "$have_archive" = 1 ]; then
     check "number inside a .gz file" "$(grep 'old.log.gz' "$R" | grep -c '"type":"hit"')" 1
-    check "exit code 0: everything was scanned" "$code" 0
 else
     check ".gz listed as not scanned without libarchive" "$(grep 'old.log.gz' "$R" | grep -c 'libarchive not available')" 1
-    check "exit code 1: partial coverage without libarchive" "$code" 1
+fi
+if [ "$have_pdf" = 1 ]; then
+    check "number in the text of a PDF, with its page" "$(grep 'invoice.pdf' "$R" | grep '"brand":"discover"' | grep -c '"page":1')" 1
+else
+    check "PDF listed as not fully scanned without pdftotext" "$(grep 'invoice.pdf' "$R" | grep -c 'pdftotext not available')" 1
+fi
+if [ "$have_archive$have_pdf" = 11 ]; then
+    check "exit code 0: everything was scanned" "$code" 0
+else
+    check "exit code 1: partial coverage without libarchive or pdftotext" "$code" 1
 fi
 "$BIN" report -o "$T/report" "$R" >/dev/null 2>&1
 check "report is made (Markdown, HTML, CSV)" "$(ls "$T/report.md" "$T/report.html" "$T/report.csv" 2>/dev/null | wc -l | tr -d ' ')" 3

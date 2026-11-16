@@ -11,7 +11,7 @@
 #include <string.h>
 
 #define CTX 64     /* bytes kept before the search position: boundary, keyword, token checks */
-#define TAIL 128   /* look-ahead: longest grouped number plus what follows it */
+#define TAIL 128   /* look-ahead: longest grouped number plus what follows it, also as UTF-16 */
 
 struct scanner {
     const struct scan_opts *o;
@@ -19,6 +19,7 @@ struct scanner {
     const unsigned char *buf;
     size_t len;
     uint64_t base;   /* stream offset of buf[0] */
+    int wide;        /* buf holds UTF-16 text read into single bytes: no second level */
 };
 
 static inline int gc(const struct scanner *s, long i)
@@ -133,6 +134,181 @@ static int evaluate(struct scanner *s, long start, long end, const char *d, int 
     return 1;
 }
 
+static void wipe(void *p, size_t n) { memset(p, 0, n); }
+
+/* The space between two groups in the text of a PDF. pdftotext keeps the layout of the page:
+ * groups in table cells or at tab stops come out several spaces apart, not always the same
+ * number, and a number that runs over the end of a line continues on the next one, after
+ * its indent. So: a run of spaces, with at most one line break in the whole number. Returns
+ * the length of the gap when a digit follows it, else 0. */
+#define GAP_MAX 24
+static int pdf_gap(const struct scanner *s, long q, int *breaks)
+{
+    int n = 0, br = *breaks;
+    while (n < GAP_MAX) {
+        int c = gc(s, q + n);
+        if (c == ' ') n++;
+        else if (c == '\n' && !br) { br = 1; n++; }
+        else if (c == '\r' && gc(s, q + n + 1) == '\n' && !br) { br = 1; n += 2; }
+        else break;
+    }
+    if (n == 0 || n >= GAP_MAX || !isd(gc(s, q + n))) return 0;
+    *breaks = br;
+    return n;
+}
+
+/* try_grouped() for the text of a PDF, where the groups are a pdf_gap() apart. */
+static long try_grouped_pdf(struct scanner *s, long pos)
+{
+    char d[24];
+    for (int i = 0; i < 4; i++) d[i] = (char)s->buf[pos + i];
+    long got = 0, ends[5];
+    int tot[5], ng = 1, nd = 4, breaks = 0;
+    ends[0] = pos + 4;
+    tot[0] = 4;
+    long q = pos + 4;
+    int gap = pdf_gap(s, q, &breaks), run = 0;
+    if (!gap) return 0;
+    while (run < 7 && isd(gc(s, q + gap + run))) run++;
+
+    if (run == 6) {                                     /* 4-6-5 and 4-6-4 */
+        long m = q + gap, t = m + 6;
+        int g2 = pdf_gap(s, t, &breaks), last = 0;
+        while (g2 && last < 6 && isd(gc(s, t + g2 + last))) last++;
+        if (last == 5 || last == 4) {
+            for (int i = 0; i < 6; i++) d[4 + i] = (char)s->buf[m + i];
+            for (int i = 0; i < last; i++) d[10 + i] = (char)s->buf[t + g2 + i];
+            if (evaluate(s, pos, t + g2 + last, d, 10 + last, 1)) got = t + g2 + last - pos;
+        }
+    } else if (run >= 1 && run <= 4) {                  /* groups of four */
+        while (ng < 5 && gap) {
+            long t = q + gap;
+            run = 0;
+            while (run < 5 && isd(gc(s, t + run))) run++;
+            if (run == 0 || run > 4 || nd + run > 19) break;
+            for (int i = 0; i < run; i++) d[nd + i] = (char)s->buf[t + i];
+            nd += run;
+            q = t + run;
+            ends[ng] = q;
+            tot[ng] = nd;
+            ng++;
+            if (run < 4) break;
+            gap = pdf_gap(s, q, &breaks);
+        }
+        for (int k = ng - 1; k >= 0 && tot[k] >= 12 && !got; k--)
+            if (evaluate(s, pos, ends[k], d, tot[k], 1)) got = ends[k] - pos;
+    }
+    wipe(d, sizeof d);
+    return got;
+}
+
+/* A number written in groups, starting with the four digits at pos. Returns its length in
+ * bytes when it is recorded as a hit, else 0.
+ *
+ * The layouts are those of real cards: groups of four with a shorter last group where the
+ * length asks for it (4-4-4-4, 4-4-4-4-3, 4-4-4-1, ...), and 4-6-5 and 4-6-4 as American
+ * Express and Diners print them. Between the groups: one space, dash, dot or tab, or two
+ * spaces, or a space as a web form and a URL write it (+ and %20), and the same one
+ * throughout. */
+static long try_grouped(struct scanner *s, long pos)
+{
+    char d[24];
+    int c = gc(s, pos + 4), c1 = c, c2 = c, sl = 1;
+    if (s->o->pdf_text && (c == ' ' || c == '\n' || c == '\r')) return try_grouped_pdf(s, pos);
+    if (c == ' ' && gc(s, pos + 5) == ' ') sl = 2;
+    else if (c == '%' && gc(s, pos + 5) == '2' && gc(s, pos + 6) == '0') { sl = 3; c1 = '2'; c2 = '0'; }
+    else if (c != ' ' && c != '-' && c != '.' && c != '\t' && c != '+') return 0;
+#define SEP_AT(q) (gc(s, (q)) == c && (sl < 2 || gc(s, (q) + 1) == c1) && (sl < 3 || gc(s, (q) + 2) == c2))
+    for (int i = 0; i < 4; i++) d[i] = (char)s->buf[pos + i];
+    long got = 0, q = pos + 4 + sl;
+    int run = 0;
+    while (run < 7 && isd(gc(s, q + run))) run++;
+
+    if (run == 6 && SEP_AT(q + 6)) {                    /* 4-6-5 and 4-6-4 */
+        long t = q + 6 + sl;
+        int last = 0;
+        while (last < 6 && isd(gc(s, t + last))) last++;
+        if (last == 5 || last == 4) {
+            for (int i = 0; i < 6; i++) d[4 + i] = (char)s->buf[q + i];
+            for (int i = 0; i < last; i++) d[10 + i] = (char)s->buf[t + i];
+            if (evaluate(s, pos, t + last, d, 10 + last, 1)) got = t + last - pos;
+        }
+    } else if (run >= 1 && run <= 4) {                  /* groups of four */
+        long ends[5];
+        int tot[5], ng = 1, nd = 4;
+        ends[0] = pos + 4;
+        tot[0] = 4;
+        q = pos + 4;
+        while (ng < 5 && SEP_AT(q)) {
+            long t = q + sl;
+            run = 0;
+            while (run < 5 && isd(gc(s, t + run))) run++;
+            if (run == 0 || run > 4 || nd + run > 19) break;
+            for (int i = 0; i < run; i++) d[nd + i] = (char)s->buf[t + i];
+            nd += run;
+            q = t + run;
+            ends[ng] = q;
+            tot[ng] = nd;
+            ng++;
+            if (run < 4) break;                         /* a shorter group is the last one */
+        }
+        /* The longest reading first: 4-4-4-4-3 before the 4-4-4-4 it starts with. */
+        for (int k = ng - 1; k >= 0 && tot[k] >= 12 && !got; k--)
+            if (evaluate(s, pos, ends[k], d, tot[k], 1)) got = ends[k] - pos;
+    }
+#undef SEP_AT
+    wipe(d, sizeof d);
+    return got;
+}
+
+static long try_candidate(struct scanner *s, long pos);
+
+/* UTF-16 text: every character is two bytes, so a number reads 4 \0 5 \0 3 \0 ... and is
+ * not a run of digits. Where a digit is followed by a zero byte and another digit, the
+ * characters around it are read as UTF-16 into a small buffer, with anything outside ASCII
+ * as one non-word byte, and the same matcher runs on that. It works anywhere in a file,
+ * with or without a byte-order mark: a Windows text file, or a text column inside a
+ * database file. Returns the length in bytes when a hit was recorded, else 0. */
+#define WIDE_BEFORE 64   /* characters before: boundary, keyword and token checks */
+#define WIDE_AFTER 48    /* the longest grouped number is 27 characters, plus what follows */
+static long try_wide(struct scanner *s, long pos)
+{
+    if (s->wide) return 0;
+    if (gc(s, pos - 1) == 0 && isd(gc(s, pos - 2))) return 0;   /* inside a number already tried */
+    unsigned char w[WIDE_BEFORE + WIDE_AFTER];
+    struct scan_result *res = s->res;
+    long got = 0;
+    /* hi: where the second byte of a character is. +1 is little endian, what Windows writes. */
+    for (int hi = 1; hi >= -1 && !got; hi -= 2) {
+        int n = 0, start;
+        for (int i = -WIDE_BEFORE; i < 0; i++) {
+            int c = gc(s, pos + 2L * i), h = gc(s, pos + 2L * i + hi);
+            if (c < 0 || h < 0) { n = 0; continue; }            /* before the buffer: start later */
+            w[n++] = (unsigned char)(h == 0 ? c : 0x80);
+        }
+        start = n;
+        for (int i = 0; i < WIDE_AFTER; i++) {
+            int c = gc(s, pos + 2L * i), h = gc(s, pos + 2L * i + hi);
+            if (c < 0 || h < 0) break;
+            w[n++] = (unsigned char)(h == 0 ? c : 0x80);
+        }
+        if (n - start < 12 || !isd(w[start]) || (start > 0 && isd(w[start - 1]))) continue;
+        struct scanner t = { .o = s->o, .res = res, .buf = w, .len = (size_t)n, .base = 0, .wide = 1 };
+        size_t n0 = res->n;
+        uint64_t drop0 = res->dropped, ct = res->cand_total, cl = res->cand_luhn;
+        long adv = try_candidate(&t, start);
+        if (res->n > n0 || res->dropped > drop0) {
+            if (res->n > n0) res->hits[n0].offset = s->base + (uint64_t)pos;
+            got = adv * 2;
+        } else {                                                /* not counted twice */
+            res->cand_total = ct;
+            res->cand_luhn = cl;
+        }
+    }
+    wipe(w, sizeof w);
+    return got;
+}
+
 /* A digit run starts at pos. Returns how far to advance. */
 static long try_candidate(struct scanner *s, long pos)
 {
@@ -144,33 +320,13 @@ static long try_candidate(struct scanner *s, long pos)
     if (run >= 12) {
         for (int i = 0; i < run; i++) d[i] = (char)s->buf[pos + i];
         evaluate(s, pos, pos + run, d, run, 0);
-        memset(d, 0, sizeof d);
+        wipe(d, sizeof d);
         return run;
     }
-    if (run == 4) {
-        /* Real card groupings only, with the same separator throughout. */
-        static const int pats[3][6] = { { 4, 4, 4, 4, 3, 0 }, { 4, 4, 4, 4, 0 }, { 4, 6, 5, 0 } };
-        int sep = gc(s, pos + 4);
-        if (sep == ' ' || sep == '-') {
-            for (int p = 0; p < 3; p++) {
-                long q = pos;
-                int nd = 0, ok = 1;
-                for (int g = 0; pats[p][g] && ok; g++) {
-                    if (g > 0) { if (gc(s, q) != sep) { ok = 0; break; } q++; }
-                    for (int k = 0; k < pats[p][g]; k++, q++) {
-                        if (!isd(gc(s, q))) { ok = 0; break; }
-                        d[nd++] = (char)s->buf[q];
-                    }
-                }
-                if (ok && !isd(gc(s, q)) && evaluate(s, pos, q, d, nd, 1)) {
-                    memset(d, 0, sizeof d);
-                    return q - pos;
-                }
-            }
-            memset(d, 0, sizeof d);
-        }
-    }
-    return run;
+    long got = 0;
+    if (run == 4) got = try_grouped(s, pos);
+    else if (run == 1 && gc(s, pos + 1) == 0 && isd(gc(s, pos + 2))) got = try_wide(s, pos);
+    return got ? got : run;
 }
 
 static int is_binary_db(const unsigned char *b, size_t len)

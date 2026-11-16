@@ -8,7 +8,7 @@ sequence       = on    # ascending or descending run of digits
 low-luhn-ratio = on    # the file's Luhn pass rate is what random numbers give
 id-keyword     = on    # labelled as an ID just before the number, on the same line
 inside-token   = on    # part of a longer identifier joined by . / : = or -
-package-file   = on    # unchanged file of an installed package (dpkg; needs libcrypto)
+package-file   = on    # unchanged file of an installed package (dpkg; needs libcrypto with MD5)
 test-path      = on    # test or library folder, only together with another rule
 binary-context = on    # digits between non-printable bytes, outside known database formats
 

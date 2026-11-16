@@ -8,6 +8,7 @@
 #include <limits.h>
 #include <pthread.h>
 #include <signal.h>
+#include <spawn.h>
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
@@ -15,7 +16,10 @@
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/wait.h>
 #include <unistd.h>
+
+extern char **environ;
 
 #define LA_BUF 65536
 #define ARCHIVE_EOF 1
@@ -25,7 +29,7 @@
 
 struct counters {
     uint64_t files, bytes, dirs, hits_open, hits_marked, skipped, symlinks, other_fs,
-             excluded, special, archives, members, unlisted;
+             excluded, special, archives, members, unlisted, pdfs;
     uint64_t by_rule[R_COUNT];
 };
 
@@ -55,6 +59,7 @@ struct filectx {
     const char *limit;       /* set when a limit stopped the scan of this file */
     int pkg_state;           /* 0 not asked, 1 unchanged package file, -1 not */
     char pkg[128];
+    const struct pdf_run *pdf;   /* set while the text of a PDF is scanned: hits get their page */
 };
 
 struct source {
@@ -63,6 +68,9 @@ struct source {
     void *ar;                /* archive this member is read from, or NULL */
     unsigned char peek[512];
     size_t peek_len, peek_pos;
+    int tee, tee_fd;         /* tee: what is read is also copied to tee_fd (a PDF inside an archive) */
+    int tee_over;            /* 1: larger than max_pdf_size, 2: the copy could not be written */
+    uint64_t tee_len;
 };
 
 static const struct config *cfg;
@@ -105,6 +113,22 @@ static void emit_skip(struct worker *w, const char *path, const char *member, co
     w->c.skipped++;
 }
 
+/* A PDF whose text was read in part: the page counts go with the reason. */
+static void emit_skip_pages(struct worker *w, const char *path, const char *member, const char *reason,
+                            long pages, long without_text)
+{
+    struct strbuf *b = &w->sb;
+    sb_reset(b);
+    sb_add(b, "{\"type\":\"skip\",\"path\":");
+    sb_json_str(b, path);
+    if (member) { sb_add(b, ",\"member\":"); sb_json_str(b, member); }
+    sb_add(b, ",\"reason\":");
+    sb_json_str(b, reason);
+    sb_printf(b, ",\"pages_read\":%ld,\"pages_without_text\":%ld}\n", pages, without_text);
+    out_line(b);
+    w->c.skipped++;
+}
+
 /* A file with more hits than max_hits_per_file: read to the end, the rest counted only. */
 static void emit_unlisted(struct filectx *fc)
 {
@@ -142,6 +166,7 @@ static void emit_hits(struct filectx *fc, const char *member, struct scan_result
         if (member) { sb_add(b, ",\"member\":"); sb_json_str(b, member); }
         sb_printf(b, ",\"brand\":\"%s\",\"masked\":\"%s\",\"digits\":%d,\"offset\":%llu,\"track\":%d",
                   h->brand, h->masked, h->ndigits, (unsigned long long)h->offset, h->track);
+        if (fc->pdf) sb_printf(b, ",\"page\":%ld", pdf_page_of(fc->pdf, h->offset));
         sb_printf(b, ",\"mtime\":\"%s\",\"ctime\":\"%s\",\"marks\":[", mtime, ctime_s);
         int first = 1;
         for (int r = 0; r < R_COUNT; r++) {
@@ -207,17 +232,34 @@ static ssize_t src_raw(struct source *s, void *buf, size_t n)
     return r;
 }
 
+/* The copy of a PDF that cannot be read twice, for pdftotext. It stops at max_pdf_size. */
+static void tee_write(struct source *s, const char *buf, size_t n)
+{
+    if (s->tee_over) return;
+    if (cfg->max_pdf_size && s->tee_len + n > cfg->max_pdf_size) { s->tee_over = 1; return; }
+    while (n) {
+        ssize_t k = write(s->tee_fd, buf, n);
+        if (k < 0 && errno == EINTR) continue;
+        if (k <= 0) { s->tee_over = 2; return; }
+        buf += k;
+        n -= (size_t)k;
+        s->tee_len += (uint64_t)k;
+    }
+}
+
 static ssize_t src_read(void *cookie, void *buf, size_t n)
 {
     struct source *s = cookie;
+    ssize_t r;
     if (s->peek_pos < s->peek_len) {
         size_t k = s->peek_len - s->peek_pos;
         if (k > n) k = n;
         memcpy(buf, s->peek + s->peek_pos, k);
         s->peek_pos += k;
-        return (ssize_t)k;
-    }
-    return src_raw(s, buf, n);
+        r = (ssize_t)k;
+    } else r = src_raw(s, buf, n);
+    if (r > 0 && s->tee) tee_write(s, buf, (size_t)r);
+    return r;
 }
 
 static int src_sniff(struct source *s)
@@ -298,6 +340,137 @@ static void scan_archive(struct filectx *fc, struct source *src, const char *mem
     free(ck.buf);
 }
 
+/* One stream through the matcher: the bytes of a file or member, or the text of a PDF.
+ * Returns what scan_stream returns: -1 when reading failed. */
+static int scan_bytes(struct filectx *fc, scan_read_fn rd, void *cookie, const char *member)
+{
+    struct worker *w = fc->w;
+    struct scan_opts o = {
+        .rules = &rules, .keep_leading = cfg->keep_leading, .buf = w->buf, .pdf_text = fc->pdf != NULL,
+    };
+    if (cfg->max_hits_per_file) {   /* counted over the whole file, archive members included */
+        uint64_t max = (uint64_t)cfg->max_hits_per_file;
+        o.hit_limit = 1;
+        o.hit_room = fc->listed < max ? (size_t)(max - fc->listed) : 0;
+    }
+    scan_result_reset(&w->res);
+    int rc = scan_stream(&o, rd, cookie, &w->res);
+    w->c.bytes += w->res.bytes;
+    fc->listed += w->res.n;
+    fc->unlisted += w->res.dropped;
+    emit_hits(fc, member, &w->res);
+    return rc;
+}
+
+/* ---- PDF: the bytes as for any file, then the text from pdftotext ---- */
+
+static int is_pdf(const unsigned char *p, size_t n)
+{
+    if (n >= 3 && p[0] == 0xef && p[1] == 0xbb && p[2] == 0xbf) { p += 3; n -= 3; }   /* byte order mark */
+    return n >= 5 && memcmp(p, "%PDF-", 5) == 0;
+}
+
+/* A file in memory, never on disk: a copy of a PDF may hold card numbers. */
+static int mem_file(void)
+{
+#ifdef SYS_memfd_create
+    return (int)syscall(SYS_memfd_create, "chdsweep-pdf", 1u /* MFD_CLOEXEC */);
+#else
+    errno = ENOSYS;
+    return -1;
+#endif
+}
+
+#define PDF_NOT_READ "not fully scanned: PDF text not read, "
+
+static void scan_pdf_text(struct filectx *fc, int fd, const char *member)
+{
+    struct worker *w = fc->w;
+    struct pdf_run p;
+    char reason[160];
+    if (pdf_start(&p, fd, cfg->max_pdf_pages, cfg->max_pdf_memory, cfg->max_file_seconds,
+                  cfg->max_file_seconds ? fc->deadline : 0, &g_stop) < 0) {
+        emit_skip(w, fc->path, member, PDF_NOT_READ "pdftotext could not be started");
+        return;
+    }
+    struct strbuf name = { 0 };
+    if (member) { sb_add(&name, member); sb_add(&name, "!"); }
+    sb_add(&name, "(PDF text)");
+    fc->pdf = &p;
+    int rc = scan_bytes(fc, pdf_read, &p, name.s);
+    fc->pdf = NULL;
+    sb_free(&name);
+
+    int res = pdf_finish(&p);
+    if (rc < 0 && res == PDF_OK) res = PDF_BROKEN;
+    switch (res) {
+    case PDF_STOPPED:
+        break;
+    case PDF_TIMEOUT:       /* listed once for the whole file, like every limit */
+        fc->limit = "not fully scanned: time limit max_file_seconds reached";
+        break;
+    case PDF_PASSWORD:
+        emit_skip(w, fc->path, member, PDF_NOT_READ "password protected");
+        break;
+    case PDF_NO_COPY:
+        emit_skip(w, fc->path, member, PDF_NOT_READ "the document does not allow its text to be copied");
+        break;
+    case PDF_NOT_STARTED:
+        emit_skip(w, fc->path, member, PDF_NOT_READ "pdftotext could not be started");
+        break;
+    case PDF_SIGNAL:
+        snprintf(reason, sizeof reason, PDF_NOT_READ "pdftotext was stopped by signal %d", p.code);
+        emit_skip(w, fc->path, member, reason);
+        break;
+    case PDF_BROKEN:
+        snprintf(reason, sizeof reason, PDF_NOT_READ "pdftotext could not read the file (exit %d)", p.code);
+        emit_skip(w, fc->path, member, reason);
+        break;
+    default:
+        w->c.pdfs++;
+        if (p.more_pages)
+            emit_skip_pages(w, fc->path, member, "not fully scanned: PDF text, more pages than max_pdf_pages",
+                            p.pages, p.empty);
+        if (p.empty == p.pages)
+            emit_skip_pages(w, fc->path, member, "not fully scanned: PDF has no text (images only, or empty pages)",
+                            p.pages, p.empty);
+        else if (p.empty)
+            emit_skip_pages(w, fc->path, member, "not fully scanned: PDF text, some pages have no text "
+                                                 "(images only, or empty pages)", p.pages, p.empty);
+    }
+    pdf_free(&p);
+}
+
+static void scan_pdf(struct filectx *fc, struct source *src, const char *member, int depth)
+{
+    struct worker *w = fc->w;
+    struct stat st;
+    /* A plain file is opened by pdftotext itself. Anything else can be read only once,
+     * so it is copied to a file in memory while its bytes are scanned. */
+    int plain = !src->ar && src->fd >= 0 && fstat(src->fd, &st) == 0 && S_ISREG(st.st_mode);
+    const char *why = NULL;      /* why the text will not be read */
+    int fd = -1;
+    if (!cfg->pdf_text) why = PDF_NOT_READ "pdf_text is off";
+    else if (!PDF.have) why = PDF_NOT_READ "pdftotext not available";
+    else if (plain) {
+        if (cfg->max_pdf_size && (uint64_t)st.st_size > cfg->max_pdf_size) why = PDF_NOT_READ "larger than max_pdf_size";
+        else fd = src->fd;
+    } else if ((fd = mem_file()) < 0) why = PDF_NOT_READ "no memory file for the copy";
+    else { src->tee = 1; src->tee_fd = fd; }
+
+    int rc = scan_bytes(fc, src_read, src, member);
+    src->tee = 0;
+    if (rc < 0 && !fc->limit)
+        emit_skip(w, fc->path, member, depth ? "not fully scanned: member unreadable" : "not fully scanned: read error");
+    else if (!fc->limit && !g_stop) {
+        if (!why && src->tee_over)
+            why = src->tee_over == 1 ? PDF_NOT_READ "larger than max_pdf_size" : PDF_NOT_READ "no memory for the copy";
+        if (why) emit_skip(w, fc->path, member, why);
+        else scan_pdf_text(fc, fd, member);
+    }
+    if (!plain && fd >= 0) close(fd);
+}
+
 static void scan_source(struct filectx *fc, struct source *src, const char *member, int depth)
 {
     struct worker *w = fc->w;
@@ -314,21 +487,11 @@ static void scan_source(struct filectx *fc, struct source *src, const char *memb
             scan_archive(fc, src, member, depth);
         return;
     }
-    struct scan_opts o = {
-        .rules = &rules, .keep_leading = cfg->keep_leading, .buf = w->buf,
-    };
-    if (cfg->max_hits_per_file) {   /* counted over the whole file, archive members included */
-        uint64_t max = (uint64_t)cfg->max_hits_per_file;
-        o.hit_limit = 1;
-        o.hit_room = fc->listed < max ? (size_t)(max - fc->listed) : 0;
+    if (is_pdf(src->peek, src->peek_len)) {
+        scan_pdf(fc, src, member, depth);
+        return;
     }
-    scan_result_reset(&w->res);
-    int rc = scan_stream(&o, src_read, src, &w->res);
-    w->c.bytes += w->res.bytes;
-    fc->listed += w->res.n;
-    fc->unlisted += w->res.dropped;
-    emit_hits(fc, member, &w->res);
-    if (rc < 0 && !fc->limit)
+    if (scan_bytes(fc, src_read, src, member) < 0 && !fc->limit)
         emit_skip(w, fc->path, member, depth ? "not fully scanned: member unreadable" : "not fully scanned: read error");
 }
 
@@ -358,22 +521,61 @@ static void process_file(struct worker *w, int dirfd, const char *name, const ch
     w->c.files++;
 }
 
-/* The system journal of the last N days, read as text from journalctl. Nothing is written. */
-static void scan_journal(struct worker *w, int days)
+/* The system journal of the last N days, read as text from journalctl, which is started
+ * directly (no shell). Nothing is written. A journalctl that fails is a gap in the coverage,
+ * and its own first line of error text is the reason. */
+static void scan_journal(struct worker *w, int days, const char *prog)
 {
-    char cmd[128], name[64];
-    snprintf(cmd, sizeof cmd, "journalctl --since=-%dd -o cat --no-pager 2>/dev/null", days);
+    char since[32], name[64], reason[400], errtext[200] = "";
+    snprintf(since, sizeof since, "--since=-%dd", days);
     snprintf(name, sizeof name, "journal (last %d days)", days);
-    FILE *p = popen(cmd, "r");
-    if (!p) { emit_skip(w, name, NULL, "not scanned: journalctl could not be started"); return; }
+    int op[2] = { -1, -1 }, ep[2] = { -1, -1 };
+    /* The error pipe never blocks: journalctl does not have to wait for us to read it. */
+    if (pipe2(op, O_CLOEXEC) < 0 || pipe2(ep, O_CLOEXEC | O_NONBLOCK) < 0) {
+        snprintf(reason, sizeof reason, "not scanned: journalctl could not be started (%s)", strerror(errno));
+        emit_skip(w, name, NULL, reason);
+        if (op[0] >= 0) { close(op[0]); close(op[1]); }
+        return;
+    }
+    char *const argv[] = { "journalctl", since, "-o", "cat", "--no-pager", NULL };
+    posix_spawn_file_actions_t fa;
+    posix_spawn_file_actions_init(&fa);
+    posix_spawn_file_actions_addopen(&fa, 0, "/dev/null", O_RDONLY, 0);
+    posix_spawn_file_actions_adddup2(&fa, op[1], 1);
+    posix_spawn_file_actions_adddup2(&fa, ep[1], 2);
+    pid_t pid;
+    int rc = posix_spawn(&pid, prog, &fa, NULL, argv, environ);
+    posix_spawn_file_actions_destroy(&fa);
+    close(op[1]);
+    close(ep[1]);
+    if (rc) {
+        snprintf(reason, sizeof reason, "not scanned: journalctl could not be started (%s)", strerror(rc));
+        emit_skip(w, name, NULL, reason);
+        close(op[0]);
+        close(ep[0]);
+        return;
+    }
     struct filectx fc = { .w = w, .path = name, .name = name, .dirfd = -1, .deadline = now_seconds() + 1e9 };
     fc.st.st_mtime = fc.st.st_ctime = time(NULL);
-    struct source src = { .fc = &fc, .fd = fileno(p), .ar = NULL };
+    struct source src = { .fc = &fc, .fd = op[0], .ar = NULL };
     scan_source(&fc, &src, NULL, 0);
     emit_unlisted(&fc);
-    int status = pclose(p);
-    if (status != 0 && !g_stop) emit_skip(w, name, NULL, "not scanned: journalctl not available or failed");
-    else w->c.files++;
+    close(op[0]);   /* a journalctl that is still writing stops here */
+
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+    ssize_t n;   /* it has ended, so what it wrote about an error is all there */
+    do n = read(ep[0], errtext, sizeof errtext - 1); while (n < 0 && errno == EINTR);
+    errtext[n > 0 ? n : 0] = 0;
+    errtext[strcspn(errtext, "\r\n")] = 0;
+    close(ep[0]);
+    if (g_stop) return;
+    if (WIFEXITED(status) && WEXITSTATUS(status) == 0) { w->c.files++; return; }
+    if (errtext[0]) snprintf(reason, sizeof reason, "not scanned: journalctl failed (%s)", errtext);
+    else if (WIFSIGNALED(status))
+        snprintf(reason, sizeof reason, "not scanned: journalctl failed (stopped by signal %d)", WTERMSIG(status));
+    else snprintf(reason, sizeof reason, "not scanned: journalctl failed (exit status %d)", WEXITSTATUS(status));
+    emit_skip(w, name, NULL, reason);
 }
 
 /* ---- walker ---- */
@@ -592,8 +794,25 @@ int cmd_scan(struct config *c, const char *config_path)
     int partial = 0;
     if (!L.have_archive) { libs_missing_message("archive", &msgs); partial = 1; }
     if (msgs.len) fputs(msgs.s, stderr);          /* also in cron mode */
+    /* A missing pdftotext is not announced on every run: most servers have no PDF in scope,
+     * and each PDF that is met is listed. With require_all_libraries it is a failure. */
+    if (c->require_all_libraries && c->pdf_text && !PDF.have) {
+        struct strbuf m = { 0 };
+        libs_missing_message("pdftotext", &m);
+        fputs(m.s, stderr);
+        sb_free(&m);
+        partial = 1;
+    }
     if (partial && c->require_all_libraries)
         return fail("a library is missing and require_all_libraries is set; not scanning");
+
+    /* Notices: what this host cannot do, without a gap in the coverage. They go into the
+     * run file for the report, and to the terminal unless the run is quiet (cron). */
+    static struct strbuf notes, quiet_notes;
+    int journal_asked = 1;
+    if (geteuid() != 0) not_root_message(&notes);
+    int pkg = rules.on[R_PACKAGE_FILE] ? pkgrule_state() : PKG_OK;
+    if (pkg != PKG_OK) pkgrule_message(pkg, &notes);
 
     /* No path given: root's folder, the home folders, the current logs and the journal of
      * the last 35 days. Rotated and compressed logs and the binary journal are left out. */
@@ -605,9 +824,18 @@ int cmd_scan(struct config *c, const char *config_path)
         };
         for (size_t i = 0; i < sizeof dpaths / sizeof dpaths[0]; i++) sl_add(&c->paths, dpaths[i]);
         for (size_t i = 0; i < sizeof dexcl / sizeof dexcl[0]; i++) sl_add(&c->excludes, dexcl[i]);
-        if (c->journal_days < 0) c->journal_days = 35;
+        if (c->journal_days < 0) { c->journal_days = 35; journal_asked = 0; }
     }
     if (c->journal_days < 0) c->journal_days = 0;
+    /* A host without journalctl has no systemd journal: nothing to scan, and no gap. In
+     * the default scope that is not worth a line on the terminal. */
+    char journalctl[4096] = "";
+    if (c->journal_days > 0 && !find_journalctl(journalctl, sizeof journalctl)) {
+        struct strbuf *to = journal_asked ? &notes : &quiet_notes;
+        no_journal_message(journal_asked, to);
+        c->journal_days = 0;
+    }
+    if (notes.len && !c->quiet) fputs(notes.s, stderr);
 
     int lock_fd = -1;
     if (c->lock_file && *c->lock_file) {
@@ -653,10 +881,13 @@ int cmd_scan(struct config *c, const char *config_path)
     json_list(&b, &c->excludes);
     sb_printf(&b, ",\"limits\":{\"max_file_size\":%llu,\"max_unpacked\":%llu,\"max_depth\":%d,"
                   "\"max_ratio\":%d,\"max_members\":%ld,\"max_file_seconds\":%d,\"max_read_rate\":%llu,"
-                  "\"max_hits_per_file\":%ld}",
+                  "\"max_hits_per_file\":%ld,\"max_pdf_pages\":%ld,\"max_pdf_size\":%llu,"
+                  "\"max_pdf_memory\":%llu}",
               (unsigned long long)c->max_file_size, (unsigned long long)c->max_unpacked, c->max_depth,
               c->max_ratio, c->max_members, c->max_file_seconds, (unsigned long long)c->max_read_rate,
-              c->max_hits_per_file);
+              c->max_hits_per_file, c->max_pdf_pages, (unsigned long long)c->max_pdf_size,
+              (unsigned long long)c->max_pdf_memory);
+    sb_printf(&b, ",\"pdf_text\":%s", c->pdf_text ? "true" : "false");
     sb_printf(&b, ",\"threads\":%d,\"keep_leading\":\"%s\",\"journal_days\":%d", c->threads,
               c->keep_leading == 6 ? "6" : "auto", c->journal_days);
     sb_add(&b, ",\"rules\":{\"source\":");
@@ -668,7 +899,11 @@ int cmd_scan(struct config *c, const char *config_path)
     if (L.have_archive) sb_json_str(&b, L.archive_version); else sb_add(&b, "null");
     sb_add(&b, ",\"libcrypto\":");
     if (L.have_crypto) sb_json_str(&b, L.crypto_version); else sb_add(&b, "null");
+    sb_add(&b, ",\"pdftotext\":");
+    if (PDF.have) sb_json_str(&b, PDF.version); else sb_add(&b, "null");
     sb_add(&b, "},\"messages\":");
+    sb_add(&msgs, notes.s ? notes.s : "");
+    sb_add(&msgs, quiet_notes.s ? quiet_notes.s : "");
     if (msgs.len) sb_json_str(&b, msgs.s); else sb_add(&b, "null");
     sb_add(&b, "}\n");
     out_line(&b);
@@ -704,7 +939,7 @@ int cmd_scan(struct config *c, const char *config_path)
     if (show) pthread_create(&pth, NULL, progress_main, &prog);
     for (int i = 0; i < c->threads; i++) pthread_join(ws[i].th, NULL);
     if (show) pthread_join(pth, NULL);
-    if (c->journal_days > 0 && !g_stop) scan_journal(&ws[0], c->journal_days);
+    if (c->journal_days > 0 && !g_stop) scan_journal(&ws[0], c->journal_days, journalctl);
 
     struct counters t = { 0 };
     for (int i = 0; i < c->threads; i++) {
@@ -723,12 +958,13 @@ int cmd_scan(struct config *c, const char *config_path)
     sb_printf(&b, ",\"counters\":{\"files\":%llu,\"bytes\":%llu,\"folders\":%llu,\"archives\":%llu,"
                   "\"archive_members\":%llu,\"skipped\":%llu,\"symlinks_not_followed\":%llu,"
                   "\"other_file_systems\":%llu,\"excluded\":%llu,\"special_files\":%llu,"
-                  "\"open_hits\":%llu,\"marked_hits\":%llu,\"hits_not_listed\":%llu}",
+                  "\"open_hits\":%llu,\"marked_hits\":%llu,\"hits_not_listed\":%llu,"
+                  "\"pdf_text_read\":%llu}",
               (unsigned long long)t.files, (unsigned long long)t.bytes, (unsigned long long)t.dirs,
               (unsigned long long)t.archives, (unsigned long long)t.members, (unsigned long long)t.skipped,
               (unsigned long long)t.symlinks, (unsigned long long)t.other_fs, (unsigned long long)t.excluded,
               (unsigned long long)t.special, (unsigned long long)t.hits_open, (unsigned long long)t.hits_marked,
-              (unsigned long long)t.unlisted);
+              (unsigned long long)t.unlisted, (unsigned long long)t.pdfs);
     sb_add(&b, ",\"marked_by_rule\":{");
     for (int i = 0; i < R_COUNT; i++)
         sb_printf(&b, "%s\"%s\":%llu", i ? "," : "", rule_names[i], (unsigned long long)t.by_rule[i]);
@@ -765,6 +1001,8 @@ int cmd_scan(struct config *c, const char *config_path)
     free(ws);
     sb_free(&b);
     sb_free(&msgs);
+    sb_free(&notes);
+    sb_free(&quiet_notes);
     if (lock_fd >= 0) close(lock_fd);
     return code;
 }

@@ -1,4 +1,4 @@
-# chdsweep configuration: copy to /etc/chdsweep.conf
+# chdsweep configuration: copy to /etc/chdsweep.conf (the .deb places it there itself)
 # "key = value" lines. Every value shown is the default, unless marked as an example.
 
 # What to search. Repeat "path" for more than one. Without any path: /root, /home, the
@@ -47,5 +47,16 @@ max_file_seconds = 300      # 0: no limit
 # so one file full of numbers cannot use up the memory or fill the disk with its run file.
 max_hits_per_file = 10000   # 0: no limit
 
-# yes: a missing optional library is a failure (exit 2) instead of partial coverage.
+# Text inside PDF files. Read by the program pdftotext (package poppler-utils), started
+# once per PDF with a time and a memory limit. Without it, or with pdf_text = no, only the
+# bytes of a PDF are scanned, which finds what is stored uncompressed, and every PDF is
+# listed as not fully scanned. Pictures are never read: a scanned page is listed as a page
+# without text.
+pdf_text = yes
+max_pdf_pages = 2000        # pages read per PDF, from the first; 0: no limit
+max_pdf_size = 100M         # a larger PDF is not handed to pdftotext; 0: no limit
+max_pdf_memory = 1G         # memory limit of pdftotext; 0: no limit
+
+# yes: a missing optional library, or a missing pdftotext while pdf_text = yes, is a
+# failure (exit 2) instead of partial coverage.
 require_all_libraries = no

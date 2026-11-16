@@ -1,0 +1,27 @@
+#!/bin/sh
+# chdsweep: what dpkg runs after the package's files are removed.
+#
+# remove: the lock file goes. The config, a cron file and the run files stay, as with any
+#         package; the cron example does nothing while the binary is not there.
+# purge:  the settings and what chdsweep made also go: /etc/chdsweep (rules, BIN overrides),
+#         the cron file, the BIN tables in /var/lib/chdsweep. The run files in
+#         /var/log/chdsweep are results, not logs: they are kept, and named here.
+set -e
+case "$1" in
+remove)
+    rm -f /run/chdsweep.lock
+    ;;
+purge)
+    rm -f /run/chdsweep.lock
+    rm -f /etc/cron.d/chdsweep
+    rm -rf /etc/chdsweep /var/lib/chdsweep
+    if [ -d /var/log/chdsweep ]; then
+        if rmdir /var/log/chdsweep 2>/dev/null; then :
+        else
+            echo "chdsweep: the run files in /var/log/chdsweep are kept. They hold the results of"
+            echo "  the scans (masked numbers); remove the folder when they are no longer needed."
+        fi
+    fi
+    ;;
+esac
+exit 0

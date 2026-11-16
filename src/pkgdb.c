@@ -35,10 +35,30 @@ static void grow(void)
     free(old);
 }
 
-static void load(void)
+static const char *info_dir(void)
 {
     const char *dir = getenv("CHDSWEEP_DPKG_INFO");   /* for tests */
-    if (!dir || !*dir) dir = "/var/lib/dpkg/info";
+    return dir && *dir ? dir : "/var/lib/dpkg/info";
+}
+
+int pkgdb_present(char *dir, size_t dirlen)
+{
+    snprintf(dir, dirlen, "%s", info_dir());
+    DIR *d = opendir(dir);
+    if (!d) return 0;
+    struct dirent *de;
+    int found = 0;
+    while (!found && (de = readdir(d))) {
+        size_t nl = strlen(de->d_name);
+        found = nl > 8 && !strcmp(de->d_name + nl - 8, ".md5sums");
+    }
+    closedir(d);
+    return found;
+}
+
+static void load(void)
+{
+    const char *dir = info_dir();
     DIR *d = opendir(dir);
     if (!d) return;
     grow();
@@ -98,7 +118,7 @@ static int file_md5(int dirfd, const char *name, char hex[33])
 
 int pkgdb_unchanged(int dirfd, const char *name, const char *path, char *pkg, size_t pkglen)
 {
-    if (!L.have_crypto) return 0;
+    if (!L.md5_ok) return 0;
     pthread_once(&once, load);
     if (!table_n) return 0;
     const struct entry *e = slot(path);

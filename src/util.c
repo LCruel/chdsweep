@@ -1,6 +1,7 @@
 /* chdsweep: small helpers */
 #include "chdsweep.h"
 
+#include <ctype.h>
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
@@ -208,4 +209,10 @@ int csv_split(char *line, char **f, int max)
         p++;
     }
     return n;
+}
+
+void cut_comment(char *line)
+{
+    for (char *p = line; *p; p++)
+        if (*p == '#' && (p == line || isspace((unsigned char)p[-1]))) { *p = 0; return; }
 }

@@ -1,5 +1,6 @@
 # chdsweep build. Needs a C compiler, make and the zlib headers (zlib1g-dev, zlib-devel).
 # libarchive and libcrypto are loaded at run time, so they are not needed to build.
+# pdftotext (poppler-utils) is started as a program when it is installed.
 CC      ?= cc
 CFLAGS  ?= -O2 -g
 WARN    := -std=c11 -Wall -Wextra -Wshadow -Wformat=2 -Wstrict-prototypes
@@ -55,16 +56,24 @@ static:
 	strip build-static/chdsweep
 
 # Installs the binary and the examples. No config and no cron job: nothing runs by itself.
+# (The .deb adds /etc/chdsweep.conf with the defaults; see below.)
 install: all
 	install -D -m 0755 $(BUILD)/chdsweep $(DESTDIR)$(PREFIX)/bin/chdsweep
 	install -d -m 0755 $(DESTDIR)/etc/chdsweep
 	install -d -m 0700 $(DESTDIR)/var/log/chdsweep
 	install -d -m 0755 $(DESTDIR)/var/lib/chdsweep/bin
-	for f in README.md LICENSE NOTICE etc/*.example; do \
+	install -D -m 0755 tests/selftest.sh $(DESTDIR)$(PREFIX)/share/chdsweep/selftest.sh
+	for f in README.md docs/*.md LICENSE NOTICE etc/*.example; do \
 		install -D -m 0644 $$f $(DESTDIR)$(PREFIX)/share/doc/chdsweep/$$(basename $$f) || exit 1; done
 
 # A .deb that uses the distribution's own libraries. Build it on the oldest release it
-# has to run on; tools/build-release.sh does that in a container.
+# has to run on; tools/build-release.sh does that in a container. The package names the
+# oldest C library the binary runs with, read from the binary, so that dpkg refuses an
+# older system with a clear message instead of the loader failing at the first run.
+# It places /etc/chdsweep.conf, the example with every value at its default, as a
+# conffile: dpkg keeps a changed one on upgrade and removes it only on purge. Still no
+# cron job: the package starts nothing by itself. tools/deb-postrm cleans up on remove
+# and purge; tools/try-deb.sh tries all of it on a clean system.
 DEBVER  := $(subst -,~,$(VERSION))
 DEBARCH := $(shell dpkg --print-architecture 2>/dev/null)
 STAGE   := $(BUILD)/deb-stage
@@ -72,10 +81,17 @@ deb: all
 	mkdir -p $(STAGE)/DEBIAN dist
 	$(MAKE) BUILD=$(BUILD) DESTDIR=$(STAGE) install
 	strip $(STAGE)$(PREFIX)/bin/chdsweep
+	sed '1s|.*|# chdsweep configuration, read by every scan unless -c names another file.|' \
+		etc/chdsweep.conf.example > $(STAGE)/etc/chdsweep.conf
+	chmod 0644 $(STAGE)/etc/chdsweep.conf
+	install -m 0755 tools/deb-postrm $(STAGE)/DEBIAN/postrm
+	echo /etc/chdsweep.conf > $(STAGE)/DEBIAN/conffiles
+	glibc=$$(objdump -T $(STAGE)$(PREFIX)/bin/chdsweep | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1 | cut -d_ -f2); \
+	[ -n "$$glibc" ] || { echo 'deb: no GLIBC version found in the binary (is objdump installed?)' >&2; exit 1; }; \
 	printf '%s\n' 'Package: chdsweep' 'Version: $(DEBVER)' 'Architecture: $(DEBARCH)' \
 		'Maintainer: D.J.S. van den Akker' 'Section: admin' 'Priority: optional' \
-		'Depends: libc6, zlib1g' \
-		'Recommends: libarchive13t64 | libarchive13, libssl3t64 | libssl3 | libssl1.1' \
+		"Depends: libc6 (>= $$glibc), zlib1g, libssl3t64 | libssl3 | libssl1.1" \
+		'Recommends: libarchive13t64 | libarchive13, poppler-utils' \
 		'Description: Cardholder data discovery for servers' \
 		' Finds payment card numbers on Linux servers, masked, and merges the' \
 		' results of many runs and hosts into one report.' > $(STAGE)/DEBIAN/control
